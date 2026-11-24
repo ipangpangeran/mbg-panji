@@ -1,4 +1,4 @@
-// Panji MBG — lightweight food ordering app.
+// MBG Ordering System — lightweight food ordering app.
 // Single-file backend: SQLite (modernc, pure Go), Gin REST API, Excel export.
 package main
 
@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"time"
 	_ "time/tzdata" // embed tz database so Asia/Jakarta works on minimal alpine images
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/xuri/excelize/v2"
@@ -42,11 +44,14 @@ const (
 )
 
 var (
-	db       *sql.DB
-	loc      *time.Location
-	orderMu  sync.Mutex // serialises quota check + insert
-	pinRegex = regexp.MustCompile(`^\d{6}$`)
-	guard    = &loginGuard{fails: map[string]*failRec{}}
+	db         *sql.DB
+	loc        *time.Location
+	orderMu    sync.Mutex // serialises quota check + insert
+	pinRegex   = regexp.MustCompile(`^\d{6}$`)
+	parenRegex = regexp.MustCompile(`\(([^()]+)\)\s*$`)
+	priceRegex = regexp.MustCompile(`(?i)^([+-])?\s*(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(k|rb|ribu)?$`)
+	unitRegex  = regexp.MustCompile(`(?i)^\d+\s*(k|rb|ribu|pcs|gr|gram|ml|l|bks|porsi)$`)
+	guard      = &loginGuard{fails: map[string]*failRec{}}
 )
 
 func env(key, def string) string {
@@ -80,10 +85,12 @@ type Order struct {
 	Timestamp     string      `json:"timestamp"`
 	Name          string      `json:"name"`
 	MainMenus     []OrderItem `json:"main_menus"`
-	MainMenu      string      `json:"main_menu"` // Formatted text e.g. "2x Paket Ayam, 1x Paket Bandeng"
+	MainMenu      string      `json:"main_menu"`
 	SideMenus     []OrderItem `json:"side_menus"`
-	CustomOptions []string    `json:"custom_options"`
+	CustomItems   []OrderItem `json:"custom_items"`
+	CustomOptions []string    `json:"custom_options"` // formatted labels for backward compatibility
 	CustomNote    string      `json:"custom_note"`
+	TotalPrice    int         `json:"total_price"`
 	PaymentMethod string      `json:"payment_method"`
 	Status        string      `json:"status"`
 }
@@ -94,17 +101,127 @@ type CountItem struct {
 }
 
 type Summary struct {
-	Total           int         `json:"total"`        // Total main portions (against quota)
-	OrderCount      int         `json:"order_count"`  // Total customer transactions
-	Quota           int         `json:"quota"`
-	Remaining       int         `json:"remaining"`
-	IsOpen          bool        `json:"is_open"`
-	ByMainMenu      []CountItem `json:"by_main_menu"`
-	BySideMenu      []CountItem `json:"by_side_menu"`
-	ByCustomOption  []CountItem `json:"by_custom_option"`
-	CustomOrderCnt  int         `json:"custom_order_count"`
-	ByPayment       []CountItem `json:"by_payment"`
-	GeneratedAt     string      `json:"generated_at"`
+	Total          int         `json:"total"`         // Total main portions (against quota)
+	OrderCount     int         `json:"order_count"`   // Total customer transactions
+	TotalRevenue   int         `json:"total_revenue"` // Sum of TotalPrice across orders
+	Quota          int         `json:"quota"`
+	Remaining      int         `json:"remaining"`
+	IsOpen         bool        `json:"is_open"`
+	ByMainMenu     []CountItem `json:"by_main_menu"`
+	BySideMenu     []CountItem `json:"by_side_menu"`
+	ByCustomOption []CountItem `json:"by_custom_option"`
+	CustomOrderCnt int         `json:"custom_order_count"`
+	ByPayment      []CountItem `json:"by_payment"`
+	GeneratedAt    string      `json:"generated_at"`
+}
+
+// ---------------------------------------------------------------------------
+// Price & Title-Case Helpers
+// ---------------------------------------------------------------------------
+
+// parseItemPrice extracts positive or negative price modifier from trailing "(15k)", "(-4k)", "(+2k)", "(Rp 15.000)".
+func parseItemPrice(raw string) int {
+	m := parenRegex.FindStringSubmatch(strings.TrimSpace(raw))
+	if len(m) < 2 {
+		return 0
+	}
+	inside := strings.TrimSpace(m[1])
+	pm := priceRegex.FindStringSubmatch(inside)
+	if len(pm) < 4 {
+		return 0
+	}
+	sign := 1
+	if pm[1] == "-" {
+		sign = -1
+	}
+	numStr := strings.ReplaceAll(pm[2], ".", "")
+	numStr = strings.ReplaceAll(numStr, ",", ".")
+	val, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0
+	}
+	if pm[3] != "" {
+		val *= 1000
+	}
+	return sign * int(math.Round(val))
+}
+
+func calcOrderTotal(mains, sides, customs []OrderItem) int {
+	total := 0
+	for _, m := range mains {
+		total += m.Qty * parseItemPrice(m.Name)
+	}
+	for _, s := range sides {
+		total += s.Qty * parseItemPrice(s.Name)
+	}
+	for _, c := range customs {
+		total += c.Qty * parseItemPrice(c.Name)
+	}
+	if total < 0 {
+		return 0
+	}
+	return total
+}
+
+func formatIDR(n int) string {
+	if n <= 0 {
+		return "Rp 0"
+	}
+	s := strconv.Itoa(n)
+	var out []byte
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, '.')
+		}
+		out = append(out, byte(c))
+	}
+	return "Rp " + string(out)
+}
+
+// titleCaseMenu capitalizes the first letter of each word while keeping unit suffixes like "(15k)", "(-4k)", "2pcs" tidy.
+func titleCaseMenu(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	// Preserve trailing parenthesized price/tag e.g. "(15k)" or "(-4k)" cleanly
+	suffix := ""
+	if m := parenRegex.FindStringIndex(s); m != nil {
+		rawTag := strings.TrimSpace(s[m[0]:])
+		inside := strings.TrimSpace(rawTag[1 : len(rawTag)-1])
+		if priceRegex.MatchString(inside) {
+			suffix = " (" + strings.ToLower(strings.ReplaceAll(inside, " ", "")) + ")"
+			s = strings.TrimSpace(s[:m[0]])
+		}
+	}
+
+	words := strings.Split(s, " ")
+	for i, w := range words {
+		if w == "" || w == "-" || w == "+" || w == "/" || w == "&" {
+			continue
+		}
+		if unitRegex.MatchString(w) {
+			words[i] = strings.ToLower(w)
+			continue
+		}
+		// Capitalize first letter after start or '/' or '('
+		runes := []rune(w)
+		capNext := true
+		for j, r := range runes {
+			if unicode.IsLetter(r) {
+				if capNext {
+					runes[j] = unicode.ToUpper(r)
+					capNext = false
+				}
+			} else if r == '/' || r == '(' || r == '-' {
+				capNext = true
+			} else {
+				capNext = false
+			}
+		}
+		words[i] = string(runes)
+	}
+	return strings.TrimSpace(strings.Join(words, " ")) + suffix
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +260,7 @@ func migrate() error {
 			side_menus_json     TEXT,
 			custom_options_json TEXT,
 			custom_note         TEXT,
+			total_price         INTEGER DEFAULT 0,
 			payment_method      TEXT,
 			status              TEXT
 		)`,
@@ -158,6 +276,7 @@ func migrate() error {
 		`ALTER TABLE Orders ADD COLUMN main_menus_json TEXT DEFAULT ''`,
 		`ALTER TABLE Orders ADD COLUMN custom_options_json TEXT DEFAULT '[]'`,
 		`ALTER TABLE Orders ADD COLUMN custom_note TEXT DEFAULT ''`,
+		`ALTER TABLE Orders ADD COLUMN total_price INTEGER DEFAULT 0`,
 	}
 	for _, s := range alterCols {
 		_, _ = db.Exec(s) // ignore duplicate column error
@@ -182,11 +301,12 @@ func seedConfig() error {
 		"Orek Tempe (3k)",
 		"Terong Balado (3k)",
 	}
+	// Tanpa Nasi -> potongan -4k per porsi (15k jadi 11k); opsi lain tetap Rp 0 (15k)
 	defaultCustom := []string{
-		"Tanpa Nasi",
+		"Tanpa Nasi (-4k)",
+		"Nasi Setengah",
 		"Tanpa Kerupuk",
 		"Tanpa Sayur/Tumis",
-		"Nasi Setengah",
 	}
 	mainMenus, _ := json.Marshal(defaultMain)
 	sideMenus, _ := json.Marshal(defaultSides)
@@ -206,17 +326,13 @@ func seedConfig() error {
 			return err
 		}
 	}
-	// Populate default QRIS image if qr_url is still empty in an existing DB
 	_, _ = db.Exec(`UPDATE Config SET value = '/qris.jpg' WHERE key = 'qr_url' AND (value IS NULL OR value = '')`)
 
-	// Upgrade untouched initial seed from v1 if no orders have been placed yet
-	var cnt int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM Orders`).Scan(&cnt); err == nil && cnt == 0 {
-		var curMain string
-		_ = db.QueryRow(`SELECT value FROM Config WHERE key = 'main_menus_json'`).Scan(&curMain)
-		if curMain == `["Paket Ayam","Paket Bandeng"]` {
-			_, _ = db.Exec(`UPDATE Config SET value = ? WHERE key = 'main_menus_json'`, string(mainMenus))
-			_, _ = db.Exec(`UPDATE Config SET value = ? WHERE key = 'side_menus_json'`, string(sideMenus))
+	// Upgrade untouched default custom_options from earlier seed ("Tanpa Nasi" -> "Tanpa Nasi (-4k)")
+	var curCustom string
+	if err := db.QueryRow(`SELECT value FROM Config WHERE key = 'custom_options_json'`).Scan(&curCustom); err == nil {
+		if curCustom == `["Tanpa Nasi","Tanpa Kerupuk","Tanpa Sayur/Tumis","Nasi Setengah"]` {
+			_, _ = db.Exec(`UPDATE Config SET value = ? WHERE key = 'custom_options_json'`, string(customOpts))
 		}
 	}
 	return nil
@@ -277,7 +393,7 @@ func parseOrderItems(raw string) []OrderItem {
 		}
 		return out
 	}
-	// Backward compatibility: array of strings from v1
+	// Backward compatibility: array of strings from earlier versions
 	var strs []string
 	if err := json.Unmarshal([]byte(raw), &strs); err == nil {
 		out := []OrderItem{}
@@ -291,6 +407,18 @@ func parseOrderItems(raw string) []OrderItem {
 	return []OrderItem{}
 }
 
+func shortMenuName(s string) string {
+	// Strip trailing price "(15k)" or "(-4k)" for concise order summaries if needed
+	body := strings.TrimSpace(parenRegex.ReplaceAllString(s, ""))
+	if idx := strings.Index(body, " - "); idx > 0 {
+		return strings.TrimSpace(body[:idx])
+	}
+	if body != "" {
+		return body
+	}
+	return s
+}
+
 func formatItems(items []OrderItem) string {
 	parts := make([]string, 0, len(items))
 	for _, it := range items {
@@ -301,16 +429,18 @@ func formatItems(items []OrderItem) string {
 	return strings.Join(parts, ", ")
 }
 
-func shortMenuName(s string) string {
-	// Keep concise display when full description is separated by " - "
-	if idx := strings.Index(s, " - "); idx > 0 {
-		return strings.TrimSpace(s[:idx])
+func formatCustomItems(items []OrderItem, note string) string {
+	parts := make([]string, 0, len(items)+1)
+	for _, it := range items {
+		if it.Qty <= 0 || it.Name == "" {
+			continue
+		}
+		if it.Qty > 1 {
+			parts = append(parts, fmt.Sprintf("%dx %s", it.Qty, shortMenuName(it.Name)))
+		} else {
+			parts = append(parts, shortMenuName(it.Name))
+		}
 	}
-	return s
-}
-
-func formatCustom(opts []string, note string) string {
-	parts := append([]string{}, opts...)
 	if strings.TrimSpace(note) != "" {
 		parts = append(parts, strings.TrimSpace(note))
 	}
@@ -332,7 +462,7 @@ func countUsedPortions() (int, error) {
 }
 
 func listOrders() ([]Order, error) {
-	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, payment_method, status
+	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status
 		FROM Orders ORDER BY timestamp DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -342,7 +472,8 @@ func listOrders() ([]Order, error) {
 	for rows.Next() {
 		var o Order
 		var ts, name, mainMenu, mainsJSON, sidesJSON, customOptsJSON, customNote, pay, status sql.NullString
-		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &sidesJSON, &customOptsJSON, &customNote, &pay, &status); err != nil {
+		var totalPrice sql.NullInt64
+		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &sidesJSON, &customOptsJSON, &customNote, &totalPrice, &pay, &status); err != nil {
 			return nil, err
 		}
 		o.Timestamp = normalizeTS(ts.String)
@@ -356,11 +487,20 @@ func listOrders() ([]Order, error) {
 			o.MainMenu = mainMenu.String
 		}
 		o.SideMenus = parseOrderItems(sidesJSON.String)
-		_ = json.Unmarshal([]byte(customOptsJSON.String), &o.CustomOptions)
-		if o.CustomOptions == nil {
-			o.CustomOptions = []string{}
+		o.CustomItems = parseOrderItems(customOptsJSON.String)
+		o.CustomOptions = make([]string, 0, len(o.CustomItems))
+		for _, ci := range o.CustomItems {
+			if ci.Qty > 1 {
+				o.CustomOptions = append(o.CustomOptions, fmt.Sprintf("%dx %s", ci.Qty, shortMenuName(ci.Name)))
+			} else {
+				o.CustomOptions = append(o.CustomOptions, shortMenuName(ci.Name))
+			}
 		}
 		o.CustomNote = customNote.String
+		o.TotalPrice = int(totalPrice.Int64)
+		if o.TotalPrice == 0 {
+			o.TotalPrice = calcOrderTotal(o.MainMenus, o.SideMenus, o.CustomItems)
+		}
 		o.PaymentMethod = pay.String
 		o.Status = status.String
 		out = append(out, o)
@@ -368,7 +508,6 @@ func listOrders() ([]Order, error) {
 	return out, rows.Err()
 }
 
-// normalizeTS makes timestamps consistent regardless of how the driver returns DATETIME.
 func normalizeTS(s string) string {
 	for _, layout := range []string{timeLayout, time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05 -0700 MST"} {
 		if t, err := time.Parse(layout, s); err == nil {
@@ -382,7 +521,7 @@ func normalizeTS(s string) string {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func cleanList(in []string) []string {
+func cleanList(in []string, autoCap bool) []string {
 	out := []string{}
 	seen := map[string]bool{}
 	for _, s := range in {
@@ -392,6 +531,9 @@ func cleanList(in []string) []string {
 		}
 		if r := []rune(s); len(r) > maxMenuLen {
 			s = string(r[:maxMenuLen])
+		}
+		if autoCap {
+			s = titleCaseMenu(s)
 		}
 		key := strings.ToLower(s)
 		if seen[key] {
@@ -431,6 +573,7 @@ func buildSummary(cfg AppConfig, orders []Order) Summary {
 	customCount := map[string]int{}
 	payCount := map[string]int{}
 	totalPortions := 0
+	totalRevenue := 0
 	customOrderCnt := 0
 
 	for _, o := range orders {
@@ -441,17 +584,17 @@ func buildSummary(cfg AppConfig, orders []Order) Summary {
 		for _, s := range o.SideMenus {
 			sideCount[s.Name] += s.Qty
 		}
-		hasCustom := len(o.CustomOptions) > 0 || strings.TrimSpace(o.CustomNote) != ""
+		hasCustom := len(o.CustomItems) > 0 || strings.TrimSpace(o.CustomNote) != ""
 		if hasCustom {
 			customOrderCnt++
 		}
-		for _, c := range o.CustomOptions {
-			customCount[c]++
+		for _, c := range o.CustomItems {
+			customCount[c.Name] += c.Qty
 		}
+		totalRevenue += o.TotalPrice
 		payCount[o.PaymentMethod]++
 	}
 
-	// Keep configured order first, then any historical items no longer in config.
 	ordered := func(conf []string, counts map[string]int) []CountItem {
 		res := []CountItem{}
 		used := map[string]bool{}
@@ -478,6 +621,7 @@ func buildSummary(cfg AppConfig, orders []Order) Summary {
 	return Summary{
 		Total:          totalPortions,
 		OrderCount:     len(orders),
+		TotalRevenue:   totalRevenue,
 		Quota:          cfg.GlobalQuota,
 		Remaining:      remaining,
 		IsOpen:         cfg.IsOpen,
@@ -541,8 +685,6 @@ func (g *loginGuard) reset(ip string) {
 	g.mu.Unlock()
 }
 
-// checkPin validates a PIN against the DB, applying the lockout guard.
-// Returns (httpStatus, errorMessage); status 0 means OK.
 func checkPin(c *gin.Context, pin string) (int, string) {
 	ip := c.ClientIP()
 	if l, d := guard.locked(ip); l {
@@ -618,7 +760,7 @@ func handleLogin(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// POST /api/config (admin) — partial update, only provided fields are changed.
+// POST /api/config (admin) — partial update, auto-capitalizes menu & custom option names.
 func handleUpdateConfig(c *gin.Context) {
 	var req struct {
 		IsOpen        *bool     `json:"is_open"`
@@ -646,7 +788,7 @@ func handleUpdateConfig(c *gin.Context) {
 		updates["global_quota"] = strconv.Itoa(*req.GlobalQuota)
 	}
 	if req.MainMenus != nil {
-		list := cleanList(*req.MainMenus)
+		list := cleanList(*req.MainMenus, true)
 		if len(list) == 0 {
 			fail(c, http.StatusBadRequest, "Minimal harus ada 1 menu utama")
 			return
@@ -655,11 +797,11 @@ func handleUpdateConfig(c *gin.Context) {
 		updates["main_menus_json"] = string(b)
 	}
 	if req.SideMenus != nil {
-		b, _ := json.Marshal(cleanList(*req.SideMenus))
+		b, _ := json.Marshal(cleanList(*req.SideMenus, true))
 		updates["side_menus_json"] = string(b)
 	}
 	if req.CustomOptions != nil {
-		b, _ := json.Marshal(cleanList(*req.CustomOptions))
+		b, _ := json.Marshal(cleanList(*req.CustomOptions, true))
 		updates["custom_options_json"] = string(b)
 	}
 	if req.QRURL != nil {
@@ -708,13 +850,14 @@ func handleUpdateConfig(c *gin.Context) {
 // POST /api/order (public)
 func handleCreateOrder(c *gin.Context) {
 	var req struct {
-		Name          string          `json:"name"`
-		MainMenu      string          `json:"main_menu"`       // Legacy single-item fallback
-		MainMenus     []OrderItem     `json:"main_menus"`      // Preferred: [{name, qty}]
-		SideMenusRaw  json.RawMessage `json:"side_menus"`      // Accepts [{name, qty}] or legacy ["name"]
-		CustomOptions []string        `json:"custom_options"`  // Quick custom tags e.g. ["Tanpa Nasi"]
-		CustomNote    string          `json:"custom_note"`     // Free-text custom request
-		PaymentMethod string          `json:"payment_method"`
+		Name             string          `json:"name"`
+		MainMenu         string          `json:"main_menu"`
+		MainMenus        []OrderItem     `json:"main_menus"`
+		SideMenusRaw     json.RawMessage `json:"side_menus"`
+		CustomItems      []OrderItem     `json:"custom_items"`   // Preferred: [{name, qty}]
+		CustomOptionsRaw json.RawMessage `json:"custom_options"` // Legacy fallback: ["name"] or [{name, qty}]
+		CustomNote       string          `json:"custom_note"`
+		PaymentMethod    string          `json:"payment_method"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		fail(c, http.StatusBadRequest, "Format permintaan tidak valid")
@@ -749,7 +892,7 @@ func handleCreateOrder(c *gin.Context) {
 		return
 	}
 	if !cfg.IsOpen {
-		fail(c, http.StatusForbidden, "Maaf, warung sedang tutup")
+		fail(c, http.StatusForbidden, "Maaf, pemesanan sedang tutup")
 		return
 	}
 
@@ -814,14 +957,39 @@ func handleCreateOrder(c *gin.Context) {
 		sides = append(sides, OrderItem{Name: sName, Qty: sidesMap[sName]})
 	}
 
-	// Validate custom_options
-	customOpts := []string{}
-	for _, co := range cleanList(req.CustomOptions) {
-		if !contains(cfg.CustomOptions, co) {
-			fail(c, http.StatusBadRequest, "Opsi custom tidak tersedia: "+co)
+	// Normalize custom_items (each option cannot exceed total main portions)
+	customsInput := req.CustomItems
+	if len(customsInput) == 0 && len(req.CustomOptionsRaw) > 0 {
+		customsInput = parseOrderItems(string(req.CustomOptionsRaw))
+	}
+	customsMap := map[string]int{}
+	customsOrder := []string{}
+	for _, it := range customsInput {
+		if it.Qty <= 0 {
+			continue
+		}
+		if !contains(cfg.CustomOptions, it.Name) {
+			fail(c, http.StatusBadRequest, "Opsi custom tidak tersedia: "+it.Name)
 			return
 		}
-		customOpts = append(customOpts, co)
+		if _, seen := customsMap[it.Name]; !seen {
+			customsOrder = append(customsOrder, it.Name)
+		}
+		customsMap[it.Name] += it.Qty
+		if customsMap[it.Name] > totalPortions {
+			customsMap[it.Name] = totalPortions
+		}
+	}
+	customs := make([]OrderItem, 0, len(customsOrder))
+	customLabels := make([]string, 0, len(customsOrder))
+	for _, cName := range customsOrder {
+		q := customsMap[cName]
+		customs = append(customs, OrderItem{Name: cName, Qty: q})
+		if q > 1 {
+			customLabels = append(customLabels, fmt.Sprintf("%dx %s", q, shortMenuName(cName)))
+		} else {
+			customLabels = append(customLabels, shortMenuName(cName))
+		}
 	}
 
 	used, err := countUsedPortions()
@@ -839,15 +1007,16 @@ func handleCreateOrder(c *gin.Context) {
 		return
 	}
 
+	totalPrice := calcOrderTotal(mains, sides, customs)
 	mainsJSON, _ := json.Marshal(mains)
 	sidesJSON, _ := json.Marshal(sides)
-	customOptsJSON, _ := json.Marshal(customOpts)
+	customsJSON, _ := json.Marshal(customs)
 	mainMenuSummary := formatItems(mains)
 	ts := time.Now().In(loc).Format(timeLayout)
 
-	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, payment_method, status)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ts, name, mainMenuSummary, string(mainsJSON), string(sidesJSON), string(customOptsJSON), note, pay, "baru")
+	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ts, name, mainMenuSummary, string(mainsJSON), string(sidesJSON), string(customsJSON), note, totalPrice, pay, "baru")
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menyimpan pesanan")
 		return
@@ -863,8 +1032,10 @@ func handleCreateOrder(c *gin.Context) {
 			MainMenus:     mains,
 			MainMenu:      mainMenuSummary,
 			SideMenus:     sides,
-			CustomOptions: customOpts,
+			CustomItems:   customs,
+			CustomOptions: customLabels,
 			CustomNote:    note,
+			TotalPrice:    totalPrice,
 			PaymentMethod: pay,
 			Status:        "baru",
 		},
@@ -896,7 +1067,6 @@ func handleResetOrders(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, "Gagal mereset data")
 		return
 	}
-	// Restart order numbering from 1.
 	_, _ = tx.Exec(`DELETE FROM sqlite_sequence WHERE name = 'Orders'`)
 	if err := tx.Commit(); err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal mereset data")
@@ -940,7 +1110,7 @@ func handleExportExcel(c *gin.Context) {
 	}
 	defer f.Close()
 
-	filename := "panji-mbg-" + time.Now().In(loc).Format("20060102-1504") + ".xlsx"
+	filename := "mbg-orders-" + time.Now().In(loc).Format("20060102-1504") + ".xlsx"
 	c.Header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
 	c.Header("Cache-Control", "no-store")
@@ -970,6 +1140,11 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 		Alignment: &excelize.Alignment{Vertical: "center", WrapText: true},
 		Border:    borders("E2E8F0"),
 	})
+	currency, _ := f.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{Horizontal: "right", Vertical: "center"},
+		Border:    borders("E2E8F0"),
+		NumFmt:    3, // #,##0
+	})
 	title, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 14, Color: "006C49"}})
 	bold, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}, Border: borders("E2E8F0")})
 	section, _ := f.NewStyle(&excelize.Style{
@@ -979,11 +1154,10 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	})
 
 	// --- Sheet: Pesanan ---
-	cols := []interface{}{"No", "Waktu", "Nama", "Menu Utama (Qty)", "Total Porsi", "Add-ons (Qty)", "Custom / Catatan", "Pembayaran", "Status"}
+	cols := []interface{}{"No", "Waktu", "Nama & Lantai", "Menu Utama (Qty)", "Total Porsi", "Add-ons (Qty)", "Custom / Catatan", "Total Tagihan (Rp)", "Pembayaran", "Status"}
 	_ = f.SetSheetRow(sOrders, "A1", &cols)
-	_ = f.SetCellStyle(sOrders, "A1", "I1", header)
+	_ = f.SetCellStyle(sOrders, "A1", "J1", header)
 	_ = f.SetRowHeight(sOrders, 1, 22)
-	// Oldest first in the spreadsheet so numbering follows order sequence.
 	for i := range orders {
 		o := orders[len(orders)-1-i]
 		row := i + 2
@@ -995,20 +1169,22 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 		if sides == "" {
 			sides = "-"
 		}
-		custom := formatCustom(o.CustomOptions, o.CustomNote)
+		custom := formatCustomItems(o.CustomItems, o.CustomNote)
 		if custom == "" {
 			custom = "-"
 		}
-		vals := []interface{}{i + 1, o.Timestamp, o.Name, o.MainMenu, portions, sides, custom, paymentLabel(o.PaymentMethod), o.Status}
+		vals := []interface{}{i + 1, o.Timestamp, o.Name, o.MainMenu, portions, sides, custom, o.TotalPrice, paymentLabel(o.PaymentMethod), o.Status}
 		ref, _ := excelize.CoordinatesToCellName(1, row)
 		_ = f.SetSheetRow(sOrders, ref, &vals)
 	}
 	if n := len(orders); n > 0 {
-		last, _ := excelize.CoordinatesToCellName(9, n+1)
+		last, _ := excelize.CoordinatesToCellName(10, n+1)
 		_ = f.SetCellStyle(sOrders, "A2", last, cell)
+		priceEnd, _ := excelize.CoordinatesToCellName(8, n+1)
+		_ = f.SetCellStyle(sOrders, "H2", priceEnd, currency)
 		_ = f.AutoFilter(sOrders, "A1:"+last, nil)
 	}
-	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 22, "D": 34, "E": 12, "F": 32, "G": 30, "H": 13, "I": 10} {
+	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 24, "D": 32, "E": 12, "F": 30, "G": 30, "H": 18, "I": 13, "J": 10} {
 		_ = f.SetColWidth(sOrders, col, col, w)
 	}
 	_ = f.SetPanes(sOrders, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
@@ -1028,11 +1204,12 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 		}
 		r++
 	}
-	put("Rekap Pesanan Panji MBG", nil, 0)
+	put("Rekap Pesanan MBG Ordering System", nil, 0)
 	_ = f.SetCellStyle(sSummary, "A1", "A1", title)
 	put("Dibuat", sum.GeneratedAt, 0)
 	r++
 	put("Total Porsi Terjual", sum.Total, bold)
+	put("Total Estimasi Omzet", formatIDR(sum.TotalRevenue), bold)
 	put("Jumlah Pemesan", sum.OrderCount, cell)
 	put("Pesanan Custom", sum.CustomOrderCnt, cell)
 	put("Kuota Global", sum.Quota, cell)
@@ -1047,7 +1224,7 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	}
 	block("Menu Utama (Porsi)", sum.ByMainMenu)
 	block("Add-ons (Qty)", sum.BySideMenu)
-	block("Kategori Custom", sum.ByCustomOption)
+	block("Kategori Custom (Porsi)", sum.ByCustomOption)
 	block("Pembayaran (Transaksi)", sum.ByPayment)
 	_ = f.SetColWidth(sSummary, "A", "A", 54)
 	_ = f.SetColWidth(sSummary, "B", "B", 22)
@@ -1095,7 +1272,6 @@ func main() {
 	}
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
-	// Trust loopback + private ranges (Nginx on host / Docker bridge) for X-Forwarded-For.
 	_ = r.SetTrustedProxies([]string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"})
 	r.Use(func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
@@ -1156,7 +1332,7 @@ func main() {
 	})
 
 	addr := ":" + env("PORT", "8080")
-	log.Printf("Panji MBG listening on %s (db: %s, tz: %s)", addr, dbPath, loc)
+	log.Printf("MBG Ordering System listening on %s (db: %s, tz: %s)", addr, dbPath, loc)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           r,
