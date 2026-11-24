@@ -1213,9 +1213,8 @@ func handleCreateOrder(c *gin.Context) {
 		return
 	}
 	pay := strings.ToLower(strings.TrimSpace(req.PaymentMethod))
-	if pay != "cash" && pay != "qris" {
-		fail(c, http.StatusBadRequest, "Metode pembayaran tidak valid")
-		return
+	if pay == "" {
+		pay = "-"
 	}
 
 	note := strings.Join(strings.Fields(req.CustomNote), " ")
@@ -1537,9 +1536,9 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	})
 
 	// --- Sheet: Pesanan ---
-	cols := []interface{}{"No", "Waktu", "Nama & Lantai", "Menu Paket (Qty)", "Menu Ala Carte (Qty)", "Slot Kuota", "Add-ons (Qty)", "Custom / Catatan", "Total Tagihan (Rp)", "Pembayaran", "Status"}
+	cols := []interface{}{"No", "Waktu", "Nama & Lantai", "Menu Paket (Qty)", "Menu Ala Carte (Qty)", "Slot Kuota", "Add-ons (Qty)", "Custom / Catatan", "Total Tagihan (Rp)", "Status"}
 	_ = f.SetSheetRow(sOrders, "A1", &cols)
-	_ = f.SetCellStyle(sOrders, "A1", "K1", header)
+	_ = f.SetCellStyle(sOrders, "A1", "J1", header)
 	_ = f.SetRowHeight(sOrders, 1, 22)
 	for i := range orders {
 		o := orders[len(orders)-1-i]
@@ -1560,18 +1559,18 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 		if custom == "" {
 			custom = "-"
 		}
-		vals := []interface{}{i + 1, o.Timestamp, o.Name, mains, alacartes, o.QuotaUsed, sides, custom, o.TotalPrice, paymentLabel(o.PaymentMethod), o.Status}
+		vals := []interface{}{i + 1, o.Timestamp, o.Name, mains, alacartes, o.QuotaUsed, sides, custom, o.TotalPrice, o.Status}
 		ref, _ := excelize.CoordinatesToCellName(1, row)
 		_ = f.SetSheetRow(sOrders, ref, &vals)
 	}
 	if n := len(orders); n > 0 {
-		last, _ := excelize.CoordinatesToCellName(11, n+1)
+		last, _ := excelize.CoordinatesToCellName(10, n+1)
 		_ = f.SetCellStyle(sOrders, "A2", last, cell)
 		priceEnd, _ := excelize.CoordinatesToCellName(9, n+1)
 		_ = f.SetCellStyle(sOrders, "I2", priceEnd, currency)
 		_ = f.AutoFilter(sOrders, "A1:"+last, nil)
 	}
-	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 24, "D": 30, "E": 30, "F": 11, "G": 28, "H": 28, "I": 18, "J": 13, "K": 10} {
+	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 24, "D": 30, "E": 30, "F": 11, "G": 28, "H": 28, "I": 18, "J": 10} {
 		_ = f.SetColWidth(sOrders, col, col, w)
 	}
 	_ = f.SetPanes(sOrders, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
@@ -1615,7 +1614,6 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	block("Menu Ala Carte (Qty)", sum.ByAlacarteMenu)
 	block("Add-ons (Qty)", sum.BySideMenu)
 	block("Kategori Custom (Porsi)", sum.ByCustomOption)
-	block("Pembayaran (Transaksi)", sum.ByPayment)
 	_ = f.SetColWidth(sSummary, "A", "A", 54)
 	_ = f.SetColWidth(sSummary, "B", "B", 22)
 
