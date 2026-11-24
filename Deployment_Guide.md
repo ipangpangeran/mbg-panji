@@ -54,7 +54,7 @@ mkdir -p data
 
 > **Catatan Arsitektur Penting:**
 > - Container berjalan di `WORKDIR /app` dengan `DB_PATH=/app/data/app.db` yang terhubung ke volume host `./data:/app/data`, sehingga data pesanan & konfigurasi **tidak akan hilang** saat container di-*rebuild*.
-> - File statis `index.html` dan `qris.jpg` otomatis ikut disalin ke `/app/` saat proses *Docker build*.
+> - File statis `index.html`, `logo.jpg`, dan `qris.jpg` otomatis ikut disalin ke `/app/` saat proses *Docker build*.
 > - Port container di-bind ke `127.0.0.1:8080:8080` supaya port `8080` aman dari akses langsung internet (hanya bisa diakses lewat Nginx).
 
 ---

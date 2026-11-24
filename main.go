@@ -1108,12 +1108,19 @@ func main() {
 	staticDir := env("STATIC_DIR", ".")
 	indexPath := filepath.Join(staticDir, "index.html")
 	qrisPath := filepath.Join(staticDir, "qris.jpg")
+	logoPath := filepath.Join(staticDir, "logo.jpg")
 	serveIndex := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.File(indexPath)
 	}
+	serveLogo := func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=86400")
+		c.File(logoPath)
+	}
 	r.GET("/", serveIndex)
 	r.GET("/index.html", serveIndex)
+	r.GET("/logo.jpg", serveLogo)
+	r.GET("/favicon.ico", serveLogo)
 	r.GET("/qris.jpg", func(c *gin.Context) {
 		c.Header("Cache-Control", "public, max-age=3600")
 		c.File(qrisPath)

@@ -62,6 +62,7 @@ Aplikasi pemesanan katering/warung makan berbasis **Go (Gin) + SQLite + Tailwind
 mbg-panji/
 ├── main.go              # Seluruh logika backend: SQLite, Auth PIN, REST API, & Export Excel
 ├── index.html           # Single-Page App (Pelanggan & Admin Dashboard)
+├── logo.jpg             # Logo resmi MBG APS (Header & Favicon)
 ├── qris.jpg             # Gambar QRIS default (MBG APS, Layanan Katering)
 ├── run-dev.ps1          # Script helper menjalankan server lokal di Windows (tanpa Docker)
 ├── Dockerfile           # Multi-stage build (golang:1.21-alpine -> alpine:latest)

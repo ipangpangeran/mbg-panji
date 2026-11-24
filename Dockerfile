@@ -16,7 +16,7 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 COPY --from=builder /out/panji-mbg /app/panji-mbg
-COPY index.html qris.jpg /app/
+COPY index.html qris.jpg logo.jpg /app/
 RUN mkdir -p /app/data
 
 ENV PORT=8080 \
