@@ -318,9 +318,9 @@
           <span class="text-xs text-on-surface-variant">Opsional</span>
         </div>
 
-        <!-- Custom Options Grid (selalu tampil agar pelanggan langsung melihat opsi custom) -->
+        <!-- Custom Options Grid (muncul otomatis saat memilih Menu Paket biar halaman tetap ringkas) -->
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-2"
-             x-show="config.custom_options && config.custom_options.length">
+             x-show="totalMainQty > 0 && config.custom_options && config.custom_options.length" x-transition>
           <template x-for="co in config.custom_options" :key="'co-' + co">
             <div class="p-2.5 rounded-2xl border flex items-center justify-between gap-2 transition-all"
                  :class="getCustomQty(co) > 0 ? 'bg-amber-50/90 border-amber-400 shadow-sm' : 'bg-surface-container-lowest border-slate-200/80 hover:bg-surface-container-low/50'">
