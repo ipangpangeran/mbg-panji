@@ -11,6 +11,7 @@ backups/
 *.exe
 *.out
 panji-mbg
+panji-mbg.new
 
 # OS / Editor junk
 .DS_Store

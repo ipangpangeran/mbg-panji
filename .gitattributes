@@ -1,4 +1,5 @@
-# Ensure Linux shell scripts & Docker files always use Unix LF line endings
+# Ensure Linux shell scripts & config files always use Unix LF line endings
 *.sh text eol=lf
+*.cjs text eol=lf
 Dockerfile text eol=lf
 docker-compose.yml text eol=lf

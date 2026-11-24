@@ -60,14 +60,15 @@ Aplikasi pemesanan katering/warung makan berbasis **Go (Gin) + SQLite + Tailwind
 
 ```text
 mbg-panji/
-├── main.go              # Seluruh logika backend: SQLite, Auth PIN, REST API, & Export Excel
-├── index.html           # Single-Page App (Pelanggan & Admin Dashboard)
-├── logo.jpg             # Logo resmi MBG APS (Header & Favicon)
-├── qris.jpg             # Gambar QRIS default (MBG APS, Layanan Katering)
-├── deploy.sh            # Script 1-klik auto-deploy di server Ubuntu (git pull + backup + rebuild)
-├── run-dev.ps1          # Script helper menjalankan server lokal di Windows (tanpa Docker)
-├── Dockerfile           # Multi-stage build (golang:1.21-alpine -> alpine:latest)
-├── docker-compose.yml   # Konfigurasi container & volume persistence ./data
+├── main.go                # Seluruh logika backend: SQLite, Auth PIN, REST API, & Export Excel
+├── index.html             # Single-Page App (Pelanggan & Admin Dashboard)
+├── logo.jpg               # Logo resmi MBG APS (Header & Favicon)
+├── qris.jpg               # Gambar QRIS default (MBG APS, Layanan Katering)
+├── ecosystem.config.cjs   # Konfigurasi PM2 production (Native Go binary, RAM ~12 MB)
+├── deploy.sh              # Script 1-klik auto-deploy Native Go + PM2 (0-2 detik!)
+├── run-dev.ps1            # Script helper menjalankan server lokal di Windows
+├── Dockerfile             # (Opsional) Alternatif deployment via container Docker
+├── docker-compose.yml     # (Opsional) Konfigurasi Docker Compose
 ├── go.mod / go.sum      # Dependensi Go
 └── data/                # (Otomatis dibuat) Lokasi file SQLite app.db
 ```
@@ -162,76 +163,25 @@ Seluruh *endpoint* admin dilindungi menggunakan HTTP Header `X-Admin-Pin: <6-dig
 
 ---
 
-## 🚀 Deployment ke Production (Ubuntu + Docker + Nginx)
+## 🚀 Deployment ke Production (Rekomendasi: Native Go + PM2 + Nginx)
 
-Panduan lengkap men-deploy **Panji MBG** di VPS Ubuntu 22.04 / 24.04 menggunakan Docker Compose dan Nginx Reverse Proxy.
+Untuk server VPS yang berbagi resource dengan aplikasi lain, **sangat direkomendasikan menjalankan binary Go langsung via PM2 (tanpa Docker)** menggunakan script otomatis [deploy.sh](deploy.sh):
+- **Deploy ke-2 dst cuma 0–2 detik** (karena cache kompilasi SQLite tersimpan di host, dan perubahan `index.html`/aset otomatis *skip* compile).
+- **Hemat CPU & RAM:** Dibatasi `GOMAXPROCS=1` + `nice -n 19` saat compile, dan hanya memakan **~12 MB RAM** saat melayani 50+ pengguna bersamaan.
 
-### 1. Persiapan Docker di Server Ubuntu
 ```bash
-sudo apt update && sudo apt install -y ca-certificates curl gnupg git
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker $USER
-```
-
-### 2. Clone Repository & Atur PIN Awal
-```bash
-sudo mkdir -p /opt/mbg-panji && sudo chown $USER:$USER /opt/mbg-panji
-cd /opt/mbg-panji
+# Setup pertama kali di server Ubuntu (otomatis install Go jika belum ada & migrasi dari Docker):
+sudo mkdir -p /var/www/panji-mbg && sudo chown -R $USER:$USER /var/www/panji-mbg
+cd /var/www/panji-mbg
 git clone https://github.com/ipangpangeran/mbg-panji.git .
-mkdir -p data
-```
-Edit `docker-compose.yml` bila perlu:
-- Ubah `ADMIN_PIN=123456` ke 6 digit PIN pilihanmu sebelum menjalankan pertama kali.
-- Port sudah dikonfigurasi aman ke `"127.0.0.1:8080:8080"` agar hanya bisa diakses melalui Nginx di host. *(Lihat juga [Deployment_Guide.md](Deployment_Guide.md) untuk panduan operasional lengkap).*
+chmod +x deploy.sh
+sudo ln -sf /var/www/panji-mbg/deploy.sh /usr/local/bin/deploy-mbg
 
-### 3. Build & Jalankan Container
-```bash
-docker compose up -d --build
-docker compose ps
-curl http://127.0.0.1:8080/healthz   # Output: {"ok":true}
+# Jalankan deploy! (Ke depannya cukup ketik 1 kata ini setiap habis git push):
+deploy-mbg
 ```
 
-### 4. Konfigurasi Nginx Reverse Proxy
-```bash
-sudo apt install -y nginx
-sudo nano /etc/nginx/sites-available/mbg-panji
-```
-Masukkan konfigurasi berikut (ganti `panji.domainkamu.com` dengan domain asli):
-```nginx
-server {
-    listen 80;
-    server_name panji.domainkamu.com;
-
-    client_max_body_size 4m; # Mengizinkan upload gambar QRIS dari dashboard admin
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 60s;
-    }
-}
-```
-Aktifkan virtual host:
-```bash
-sudo ln -s /etc/nginx/sites-available/mbg-panji /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-### 5. Aktifkan HTTPS Gratis (Let's Encrypt)
-Wajib menggunakan HTTPS di production agar header PIN Admin terenkripsi dan fitur *Clipboard* (**Salin Rekap WA**) berjalan lancar di semua browser HP:
-```bash
-sudo apt install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d panji.domainkamu.com
-```
+Panduan lengkap konfigurasi Nginx + Cloudflare serta alternatif Docker tersedia di **[Deployment_Guide.md](Deployment_Guide.md)**.
 
 ---
 
