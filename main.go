@@ -53,7 +53,56 @@ var (
 	barePriceSuffix  = regexp.MustCompile(`(?i)(?:^|\s)((?:[+-]\s*)?(?:rp\.?\s*\d+(?:[.,]\d+)?(?:\s*(?:k|rb|ribu))?|\d+(?:[.,]\d+)?\s*(?:k|rb|ribu)|[+-]\s*\d{3,}|\d{4,}))\s*$`)
 	unitRegex        = regexp.MustCompile(`(?i)^\d+\s*(k|rb|ribu|pcs|gr|gram|ml|l|bks|porsi)$`)
 	guard            = &loginGuard{fails: map[string]*failRec{}}
+	eventsHub        = newSSEHub()
 )
+
+// ---------------------------------------------------------------------------
+// Real-time SSE Broadcaster (pushes global quota & config updates to all devices)
+// ---------------------------------------------------------------------------
+
+type sseHub struct {
+	mu      sync.Mutex
+	clients map[chan string]struct{}
+}
+
+func newSSEHub() *sseHub {
+	return &sseHub{clients: make(map[chan string]struct{})}
+}
+
+func (h *sseHub) subscribe() chan string {
+	ch := make(chan string, 8)
+	h.mu.Lock()
+	h.clients[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *sseHub) unsubscribe(ch chan string) {
+	h.mu.Lock()
+	delete(h.clients, ch)
+	close(ch)
+	h.mu.Unlock()
+}
+
+func (h *sseHub) broadcastState() {
+	payload, err := buildPublicConfigPayload()
+	if err != nil {
+		return
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	msg := string(b)
+	h.mu.Lock()
+	for ch := range h.clients {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+	h.mu.Unlock()
+}
 
 func env(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -437,6 +486,7 @@ func migrate() error {
 			side_menus_json     TEXT,
 			custom_options_json TEXT,
 			custom_note         TEXT,
+			quota_used          INTEGER DEFAULT -1,
 			total_price         INTEGER DEFAULT 0,
 			payment_method      TEXT,
 			status              TEXT
@@ -453,6 +503,7 @@ func migrate() error {
 		`ALTER TABLE Orders ADD COLUMN alacarte_menus_json TEXT DEFAULT '[]'`,
 		`ALTER TABLE Orders ADD COLUMN custom_options_json TEXT DEFAULT '[]'`,
 		`ALTER TABLE Orders ADD COLUMN custom_note TEXT DEFAULT ''`,
+		`ALTER TABLE Orders ADD COLUMN quota_used INTEGER DEFAULT -1`,
 		`ALTER TABLE Orders ADD COLUMN total_price INTEGER DEFAULT 0`,
 	}
 	for _, s := range alterCols {
@@ -655,7 +706,7 @@ func countUsedQuota() (int, error) {
 }
 
 func listOrders() ([]Order, error) {
-	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status
+	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, quota_used, total_price, payment_method, status
 		FROM Orders ORDER BY timestamp DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -665,8 +716,8 @@ func listOrders() ([]Order, error) {
 	for rows.Next() {
 		var o Order
 		var ts, name, mainMenu, mainsJSON, alacarteJSON, sidesJSON, customOptsJSON, customNote, pay, status sql.NullString
-		var totalPrice sql.NullInt64
-		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &alacarteJSON, &sidesJSON, &customOptsJSON, &customNote, &totalPrice, &pay, &status); err != nil {
+		var quotaUsed, totalPrice sql.NullInt64
+		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &alacarteJSON, &sidesJSON, &customOptsJSON, &customNote, &quotaUsed, &totalPrice, &pay, &status); err != nil {
 			return nil, err
 		}
 		o.Timestamp = normalizeTS(ts.String)
@@ -688,7 +739,11 @@ func listOrders() ([]Order, error) {
 			}
 		}
 		o.CustomNote = customNote.String
-		o.QuotaUsed = calcQuotaUsed(o.MainMenus, o.AlacarteMenus)
+		if quotaUsed.Valid && quotaUsed.Int64 >= 0 {
+			o.QuotaUsed = int(quotaUsed.Int64)
+		} else {
+			o.QuotaUsed = calcQuotaUsed(o.MainMenus, o.AlacarteMenus)
+		}
 		o.TotalPrice = int(totalPrice.Int64)
 		if o.TotalPrice == 0 {
 			o.TotalPrice = calcOrderTotal(o.MainMenus, o.AlacarteMenus, o.SideMenus, o.CustomItems)
@@ -921,30 +976,26 @@ func adminAuth() gin.HandlerFunc {
 // Handlers
 // ---------------------------------------------------------------------------
 
-// GET /api/config (public — never exposes the PIN)
-func handleGetConfig(c *gin.Context) {
+func buildPublicConfigPayload() (gin.H, error) {
 	cfg, err := loadConfig()
 	if err != nil {
-		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
-		return
+		return nil, err
 	}
 	used, err := countUsedQuota()
 	if err != nil {
-		fail(c, http.StatusInternalServerError, "Gagal menghitung pesanan")
-		return
+		return nil, err
 	}
 	remaining := cfg.GlobalQuota - used
 	if remaining < 0 {
 		remaining = 0
 	}
-	// Tell frontend which alacarte items consume Lauk quota so both sides stay 100% consistent
 	quotaAlacartes := []string{}
 	for _, a := range cfg.AlacarteMenus {
 		if isLaukAlacarte(a) {
 			quotaAlacartes = append(quotaAlacartes, a)
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{
+	return gin.H{
 		"is_open":          cfg.IsOpen,
 		"global_quota":     cfg.GlobalQuota,
 		"main_menus":       cfg.MainMenus,
@@ -956,7 +1007,62 @@ func handleGetConfig(c *gin.Context) {
 		"used":             used,
 		"remaining":        remaining,
 		"order_date_label": formatOrderDateID(time.Now().In(loc)),
-	})
+	}, nil
+}
+
+// GET /api/config (public — never exposes the PIN)
+func handleGetConfig(c *gin.Context) {
+	payload, err := buildPublicConfigPayload()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
+		return
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+// GET /api/events — Server-Sent Events stream for instant global quota & status sync across all devices.
+func handleEvents(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // Tells Nginx not to buffer SSE frames
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	ch := eventsHub.subscribe()
+	defer eventsHub.unsubscribe(ch)
+
+	// Immediately send initial global state upon connect
+	if initPayload, err := buildPublicConfigPayload(); err == nil {
+		if b, err := json.Marshal(initPayload); err == nil {
+			_, _ = fmt.Fprintf(c.Writer, "event: state\ndata: %s\n\n", string(b))
+			flusher.Flush()
+		}
+	}
+
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	ctx := c.Request.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, open := <-ch:
+			if !open {
+				return
+			}
+			_, _ = fmt.Fprintf(c.Writer, "event: state\ndata: %s\n\n", msg)
+			flusher.Flush()
+		case <-ticker.C:
+			_, _ = fmt.Fprintf(c.Writer, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
 }
 
 // POST /api/login
@@ -1052,8 +1158,10 @@ func handleUpdateConfig(c *gin.Context) {
 		return
 	}
 
+	orderMu.Lock()
 	tx, err := db.Begin()
 	if err != nil {
+		orderMu.Unlock()
 		fail(c, http.StatusInternalServerError, "Gagal menyimpan konfigurasi")
 		return
 	}
@@ -1061,14 +1169,19 @@ func handleUpdateConfig(c *gin.Context) {
 		if _, err := tx.Exec(`INSERT INTO Config(key, value) VALUES(?, ?)
 			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
 			_ = tx.Rollback()
+			orderMu.Unlock()
 			fail(c, http.StatusInternalServerError, "Gagal menyimpan konfigurasi")
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		orderMu.Unlock()
 		fail(c, http.StatusInternalServerError, "Gagal menyimpan konfigurasi")
 		return
 	}
+	orderMu.Unlock()
+
+	eventsHub.broadcastState()
 	_, pinChanged := updates["admin_pin"]
 	c.JSON(http.StatusOK, gin.H{"ok": true, "pin_changed": pinChanged})
 }
@@ -1280,9 +1393,9 @@ func handleCreateOrder(c *gin.Context) {
 	mainMenuSummary := formatItems(mains)
 	ts := time.Now().In(loc).Format(timeLayout)
 
-	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ts, name, mainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), note, totalPrice, pay, "baru")
+	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, quota_used, total_price, payment_method, status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ts, name, mainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), note, quotaNeeded, totalPrice, pay, "baru")
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menyimpan pesanan")
 		return
@@ -1292,6 +1405,8 @@ func handleCreateOrder(c *gin.Context) {
 	if newRemaining < 0 {
 		newRemaining = 0
 	}
+	// Broadcast updated remaining quota immediately to all connected devices!
+	go eventsHub.broadcastState()
 	c.JSON(http.StatusCreated, gin.H{
 		"ok":      true,
 		"message": "Terima kasih, " + name + "!",
@@ -1344,6 +1459,7 @@ func handleResetOrders(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, "Gagal mereset data")
 		return
 	}
+	go eventsHub.broadcastState()
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -1589,9 +1705,15 @@ func main() {
 	})
 
 	api := r.Group("/api")
-	api.Use(func(c *gin.Context) { c.Header("Cache-Control", "no-store"); c.Next() })
+	api.Use(func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		c.Header("CDN-Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.Next()
+	})
 	{
 		api.GET("/config", handleGetConfig)
+		api.GET("/events", handleEvents)
 		api.POST("/login", handleLogin)
 		api.POST("/order", handleCreateOrder)
 
@@ -1617,7 +1739,7 @@ func main() {
 		Handler:           r,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      0, // 0 allows long-lived SSE (/api/events) connections
 	}
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server: %v", err)

@@ -420,8 +420,18 @@
         <p class="text-on-surface-variant leading-relaxed" x-text="orderPreviewText()"></p>
       </div>
 
+      <!-- Peringatan real-time jika sisa kuota global berkurang saat pelanggan sedang memilih -->
+      <div x-show="totalQuotaSelected > config.remaining" x-transition
+           class="flex items-start gap-2.5 p-3.5 rounded-2xl bg-red-50 border border-red-200 text-red-800 text-xs">
+        <span class="material-symbols-outlined text-[18px] flex-shrink-0">warning</span>
+        <div>
+          <p class="font-bold">Sisa kuota saat ini tinggal <span x-text="config.remaining"></span> porsi!</p>
+          <p class="mt-0.5">Pilihanmu (<span x-text="totalQuotaSelected"></span> porsi) melebihi sisa kuota. Silakan kurangi jumlah porsi terlebih dahulu.</p>
+        </div>
+      </div>
+
       <!-- Submit -->
-      <button type="submit" :disabled="submitting || !config.is_open || !hasAnyMainOrAlacarte"
+      <button type="submit" :disabled="submitting || !config.is_open || !hasAnyMainOrAlacarte || totalQuotaSelected > config.remaining"
               class="btn-primary w-full py-4 rounded-full font-head font-semibold text-[16px] shadow-lg flex items-center justify-center gap-2 group">
         <span x-show="!submitting" x-text="estimatedTotal > 0 ? 'Pesan Sekarang (' + formatIDR(estimatedTotal) + ')' : 'Pesan Sekarang'"></span>
         <span x-show="submitting">Mengirim…</span>
@@ -521,19 +531,23 @@
           </button>
         </div>
 
-        <!-- Quota -->
+        <!-- Quota (Auto-Save Real-Time ke Semua Device) -->
         <div class="glass rounded-3xl shadow-card p-5 space-y-4">
           <div class="flex items-center justify-between gap-3">
             <div>
-              <p class="font-semibold">Total Slot Lauk / Paket Hari Ini</p>
-              <p class="text-xs text-on-surface-variant">Terhitung dari Menu Paket + Lauk Ala Carte</p>
+              <div class="flex items-center gap-2">
+                <p class="font-semibold">Total Slot Lauk / Paket Hari Ini</p>
+                <span x-show="quotaSyncStatus === 'saving'" class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">Menyimpan…</span>
+                <span x-show="quotaSyncStatus === 'saved'" x-transition.opacity class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700">Tersimpan ✔</span>
+              </div>
+              <p class="text-xs text-on-surface-variant">Kuota global bersama • Otomatis tersimpan saat diubah</p>
             </div>
             <div class="flex items-center gap-1 bg-surface-container-low rounded-2xl p-1">
-              <button type="button" @click="admin.global_quota = Math.max(0, (+admin.global_quota || 0) - 1)"
+              <button type="button" @click="adjustQuota(-1)"
                       class="w-9 h-9 rounded-xl hover:bg-white flex items-center justify-center"><span class="material-symbols-outlined">remove</span></button>
-              <input type="number" min="0" x-model.number="admin.global_quota"
+              <input type="number" min="0" x-model.number="admin.global_quota" @input="scheduleQuotaSave()" @change="saveQuotaNow()"
                      class="w-16 bg-transparent text-center font-head font-bold text-xl focus:outline-none" />
-              <button type="button" @click="admin.global_quota = (+admin.global_quota || 0) + 1"
+              <button type="button" @click="adjustQuota(1)"
                       class="w-9 h-9 rounded-xl hover:bg-white text-primary flex items-center justify-center"><span class="material-symbols-outlined">add</span></button>
             </div>
           </div>
@@ -921,6 +935,7 @@ function app() {
     orders: [],
     summary: emptySummary(),
     saving: false, togglingOpen: false, exporting: false, refreshing: false,
+    quotaSyncStatus: '', quotaTimer: null, sseSource: null,
     confirmReset: false,
 
     get quotaPct() { return this.summary.quota > 0 ? Math.min(100, Math.round(this.summary.total / this.summary.quota * 100)) : 100; },
@@ -1216,6 +1231,12 @@ function app() {
       this.view = location.hash === '#admin' ? 'admin' : 'order';
       window.addEventListener('hashchange', () => { this.view = location.hash === '#admin' ? 'admin' : 'order'; this.onViewChange(); });
       window.addEventListener('keydown', (e) => this.onKey(e));
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+          this.loadConfig();
+          if (this.view === 'admin' && this.authed) this.refreshAdmin(false, false);
+        }
+      });
       await this.loadConfig();
       if (this.pin) {
         try { await this.api('/api/login', { method: 'POST', body: JSON.stringify({ pin: this.pin }) }); this.authed = true; }
@@ -1223,17 +1244,51 @@ function app() {
       }
       this.loading = false;
       this.onViewChange();
-      setInterval(() => { if (this.view === 'order') this.loadConfig(); }, 15000);
-      setInterval(() => { if (this.view === 'admin' && this.authed && !document.hidden) this.refreshAdmin(false, false); }, 10000);
+      this.connectSSE();
+      // Fast fallback polling in case any mobile carrier/proxy buffers SSE
+      setInterval(() => { if (this.view === 'order' && !document.hidden) this.loadConfig(); }, 4000);
+      setInterval(() => { if (this.view === 'admin' && this.authed && !document.hidden) this.refreshAdmin(false, false); }, 6000);
+    },
+
+    connectSSE() {
+      if (typeof EventSource === 'undefined') return;
+      try {
+        if (this.sseSource) this.sseSource.close();
+        const es = new EventSource('/api/events');
+        this.sseSource = es;
+        es.addEventListener('state', (ev) => {
+          try {
+            const c = JSON.parse(ev.data);
+            this.applyConfigState(c);
+            // If Admin dashboard is open, immediately refresh order feed & summary too
+            if (this.view === 'admin' && this.authed && !this.refreshing) {
+              this.refreshAdmin(false, false);
+            }
+          } catch {}
+        });
+      } catch {}
+    },
+
+    applyConfigState(c) {
+      if (!c || typeof c !== 'object') return;
+      c.alacarte_menus = c.alacarte_menus || [];
+      c.quota_alacartes = c.quota_alacartes || [];
+      c.custom_options = c.custom_options || [];
+      this.config = c;
+      Object.keys(this.form.main_qtys).forEach(k => { if (!c.main_menus.includes(k)) delete this.form.main_qtys[k]; });
+      Object.keys(this.form.alacarte_qtys).forEach(k => { if (!c.alacarte_menus.includes(k)) delete this.form.alacarte_qtys[k]; });
+      Object.keys(this.form.side_qtys).forEach(k => { if (!c.side_menus.includes(k)) delete this.form.side_qtys[k]; });
+      Object.keys(this.form.custom_qtys).forEach(k => { if (!c.custom_options.includes(k)) delete this.form.custom_qtys[k]; });
+      this.clampCustomQtys();
     },
 
     go(v) { location.hash = v === 'admin' ? 'admin' : ''; this.view = v; this.onViewChange(); window.scrollTo({ top: 0, behavior: 'smooth' }); },
     onViewChange() { if (this.view === 'admin' && this.authed) this.refreshAdmin(); else if (this.view === 'order') this.loadConfig(); },
 
     async api(path, opts = {}) {
-      const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+      const headers = Object.assign({ 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' }, opts.headers || {});
       if (this.pin) headers['X-Admin-Pin'] = this.pin;
-      const res = await fetch(path, Object.assign({}, opts, { headers }));
+      const res = await fetch(path, Object.assign({ cache: 'no-store' }, opts, { headers }));
       const isJSON = (res.headers.get('content-type') || '').includes('application/json');
       if (!res.ok) {
         const data = isJSON ? await res.json().catch(() => null) : null;
@@ -1252,16 +1307,8 @@ function app() {
     // ---------- customer ----------
     async loadConfig() {
       try {
-        const c = await this.api('/api/config');
-        c.alacarte_menus = c.alacarte_menus || [];
-        c.quota_alacartes = c.quota_alacartes || [];
-        c.custom_options = c.custom_options || [];
-        this.config = c;
-        Object.keys(this.form.main_qtys).forEach(k => { if (!c.main_menus.includes(k)) delete this.form.main_qtys[k]; });
-        Object.keys(this.form.alacarte_qtys).forEach(k => { if (!c.alacarte_menus.includes(k)) delete this.form.alacarte_qtys[k]; });
-        Object.keys(this.form.side_qtys).forEach(k => { if (!c.side_menus.includes(k)) delete this.form.side_qtys[k]; });
-        Object.keys(this.form.custom_qtys).forEach(k => { if (!c.custom_options.includes(k)) delete this.form.custom_qtys[k]; });
-        this.clampCustomQtys();
+        const c = await this.api('/api/config?_t=' + Date.now());
+        this.applyConfigState(c);
       } catch (e) { if (this.loading) this.notify('Gagal memuat data: ' + e.message, 'error'); }
     },
 
@@ -1373,6 +1420,33 @@ function app() {
     },
     addRow(key) {
       this.admin[key].push({ id: ++rowId, value: '' });
+    },
+    adjustQuota(delta) {
+      this.admin.global_quota = Math.max(0, (+this.admin.global_quota || 0) + delta);
+      this.scheduleQuotaSave();
+    },
+    scheduleQuotaSave() {
+      clearTimeout(this.quotaTimer);
+      this.quotaSyncStatus = 'saving';
+      this.quotaTimer = setTimeout(() => this.saveQuotaNow(), 400);
+    },
+    async saveQuotaNow() {
+      clearTimeout(this.quotaTimer);
+      const q = Math.max(0, parseInt(this.admin.global_quota, 10) || 0);
+      this.admin.global_quota = q;
+      this.quotaSyncStatus = 'saving';
+      try {
+        await this.api('/api/config', { method: 'POST', body: JSON.stringify({ global_quota: q }) });
+        this.summary.quota = q;
+        this.summary.remaining = Math.max(0, q - (this.summary.total || 0));
+        this.config.global_quota = q;
+        this.config.remaining = this.summary.remaining;
+        this.quotaSyncStatus = 'saved';
+        setTimeout(() => { if (this.quotaSyncStatus === 'saved') this.quotaSyncStatus = ''; }, 2000);
+      } catch (e) {
+        this.quotaSyncStatus = '';
+        this.notify(e.message, 'error');
+      }
     },
     async toggleOpen() {
       const next = !this.admin.is_open;
