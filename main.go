@@ -338,7 +338,28 @@ func formatIDR(n int) string {
 	return "Rp " + string(out)
 }
 
-// titleCaseMenu capitalizes each word and auto-normalizes trailing prices like "nasi 5k" -> "Nasi (5k)".
+// titleCaseName capitalizes the first letter of each word in customer name (e.g. "ipang lt 10" -> "Ipang Lt 10").
+func titleCaseName(s string) string {
+	words := strings.Fields(s)
+	for i, w := range words {
+		runes := []rune(w)
+		capNext := true
+		for j, r := range runes {
+			if unicode.IsLetter(r) {
+				if capNext {
+					runes[j] = unicode.ToUpper(r)
+					capNext = false
+				}
+			} else if r == '/' || r == '(' || r == '-' || r == '.' {
+				capNext = true
+			} else {
+				capNext = false
+			}
+		}
+		words[i] = string(runes)
+	}
+	return strings.Join(words, " ")
+}
 func titleCaseMenu(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if s == "" {
@@ -1069,7 +1090,7 @@ func handleCreateOrder(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "Format permintaan tidak valid")
 		return
 	}
-	name := strings.Join(strings.Fields(req.Name), " ")
+	name := titleCaseName(req.Name)
 	if name == "" {
 		fail(c, http.StatusBadRequest, "Nama wajib diisi")
 		return
