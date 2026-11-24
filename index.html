@@ -136,8 +136,9 @@
   <!-- ===================== CUSTOMER VIEW ===================== -->
   <section x-cloak x-show="!loading && view === 'order'" class="max-w-lg mx-auto space-y-5">
     <div class="flex items-end justify-between gap-2">
-      <div class="space-y-0.5">
-        <h1 class="font-head font-semibold text-[24px] tracking-tight">Input Pesanan</h1>
+      <div class="space-y-0.5 min-w-0">
+        <h1 class="font-head font-semibold text-[20px] sm:text-[23px] tracking-tight leading-snug"
+            x-text="'Input Pesanan - ' + orderDateLabel()"></h1>
         <p class="text-sm text-on-surface-variant" x-show="config.is_open">
           Sisa kuota lauk/paket:
           <span class="font-bold" :class="config.remaining > 0 ? 'text-primary' : 'text-error'"
@@ -145,7 +146,7 @@
         </p>
       </div>
       <span x-show="hasAnyMainOrAlacarte"
-            class="px-3 py-1 rounded-full bg-emerald-50 text-emerald-800 text-xs font-bold whitespace-nowrap"
+            class="px-3 py-1 rounded-full bg-emerald-50 text-emerald-800 text-xs font-bold whitespace-nowrap flex-shrink-0"
             x-text="estimatedTotal > 0 ? formatIDR(estimatedTotal) : (totalSelectedCount + ' item')"></span>
     </div>
 
@@ -559,9 +560,56 @@
         </h3>
 
         <div class="glass rounded-3xl shadow-card p-5 space-y-6">
+          <!-- 1. Input Menu Paket -->
+          <div class="space-y-2">
+            <div class="flex items-center justify-between gap-2">
+              <div>
+                <span class="text-sm font-semibold">Menu Paket</span>
+                <p class="text-[11px] text-on-surface-variant leading-snug">Pisahkan isi paket dengan tanda <b>+</b> &amp; tulis harga di akhir mis. <b>15k</b></p>
+              </div>
+              <span class="text-xs font-semibold text-primary whitespace-nowrap" x-text="admin.main_menus.filter(i => i.value.trim()).length + ' aktif'"></span>
+            </div>
+            <template x-for="(item, idx) in admin.main_menus" :key="item.id">
+              <div class="flex items-center gap-2">
+                <div class="relative flex-1">
+                  <span class="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-[18px] text-outline">inventory_2</span>
+                  <input type="text" x-model="item.value" @blur="item.value = toTitleCaseMenu(item.value)"
+                         maxlength="150" placeholder="cth: Nasi + Ayam Rica Kemangi + Tumis Toge + Krupuk 15k"
+                         class="field pl-10 pr-3 py-2.5 font-medium capitalize" />
+                </div>
+                <button type="button" @click="admin.main_menus.splice(idx, 1)" title="Hapus"
+                        class="w-10 h-10 rounded-xl text-tertiary hover:bg-red-50 flex items-center justify-center flex-shrink-0">
+                  <span class="material-symbols-outlined text-[20px]">delete</span>
+                </button>
+              </div>
+            </template>
+            <button type="button" @click="addRow('main_menus')"
+                    class="w-full py-2.5 rounded-xl border-2 border-dashed border-slate-200 text-sm font-semibold text-on-surface-variant hover:border-primary-container hover:text-primary transition flex items-center justify-center gap-1">
+              <span class="material-symbols-outlined text-[18px]">add</span> Tambah Menu Paket
+            </button>
+          </div>
+
+          <!-- Auto-generated Ala Carte Preview (otomatis dari pecahan Menu Paket) -->
+          <div class="p-3.5 rounded-2xl bg-blue-50/70 border border-blue-200/70 space-y-2">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-xs font-bold text-secondary flex items-center gap-1.5">
+                <span class="material-symbols-outlined text-[16px]">auto_awesome</span>
+                Menu Ala Carte (Otomatis dari Menu Paket)
+              </span>
+              <span class="text-[11px] font-semibold text-secondary" x-text="previewDerivedAlacarte().length + ' item'"></span>
+            </div>
+            <div class="flex flex-wrap gap-1.5" x-show="previewDerivedAlacarte().length">
+              <template x-for="al in previewDerivedAlacarte()" :key="'prev-' + al">
+                <span class="px-2.5 py-1 rounded-full bg-white text-xs font-semibold text-on-surface shadow-sm border border-blue-100" x-text="al"></span>
+              </template>
+            </div>
+            <p class="text-[11px] text-on-surface-variant leading-snug">
+              Otomatis dipecah tanpa ketik manual (Nasi 5k • Lauk 8k • Sayur 3k; item kembar digabung &amp; Krupuk di-skip).
+            </p>
+          </div>
+
+          <!-- 2 & 3. Menu Add-ons & Opsi Custom Paket -->
           <template x-for="group in [
-            {key:'main_menus', label:'Menu Paket', hint:'Tulis harga di akhir mis. 15k (otomatis rapi)', icon:'inventory_2', ph:'cth: paket ayam - nasi + ayam rendang 15k'},
-            {key:'alacarte_menus', label:'Menu Ala Carte (Pecahan Paket)', hint:'Cukup tulis mis. lauk ayam 8k / nasi 5k (Lauk otomatis potong kuota)', icon:'dinner_dining', ph:'cth: lauk ayam rendang 8k atau sayur tumis 3k'},
             {key:'side_menus', label:'Menu Add-ons (Gorengan / Pendamping)', hint:'Cukup tulis mis. gorengan 2pcs 3k / orek tempe 3k', icon:'add_circle', ph:'cth: gorengan 2pcs 3k atau orek tempe 3k'},
             {key:'custom_options', label:'Opsi Custom Paket', hint:'Tulis -4k / +2k jika mengubah harga paket', icon:'tune', ph:'cth: tanpa nasi -4k'}
           ]" :key="group.key">
@@ -976,8 +1024,44 @@ function app() {
       if (dashIdx > 0) {
         title = body.slice(0, dashIdx).trim();
         desc = body.slice(dashIdx + 3).trim();
+      } else if (body.includes('+')) {
+        // When written as "Nasi + Ayam Rica Kemangi + Tumis Toge + Krupuk", highlight the main Lauk as title
+        const nonLaukRe = /^(nasi|sayur|tumis|capcay|sop|sup|bening|oseng|cah|urap|pecel|krupuk|kerupuk|emping|peyek|sambal|sambel|kuah|lalap|lalapan)\b/i;
+        const lauk = body.split('+').map(p => p.trim()).find(p => p && !nonLaukRe.test(p));
+        if (lauk) {
+          title = 'Paket ' + lauk;
+          desc = body;
+        }
       }
       return { title, desc, priceLabel, signedLabel, priceNum };
+    },
+
+    // Live preview in Admin showing how Menu Paket items split into Ala Carte automatically
+    previewDerivedAlacarte() {
+      const nasiList = [], laukList = [], sayurList = [];
+      const seen = new Set();
+      const nasiRe = /^nasi\b/i;
+      const sayurRe = /^(sayur|tumis|capcay|sop|sup|bening|oseng|cah|urap|pecel|lalap|lalapan)\b/i;
+      const skipRe = /^(krupuk|kerupuk|emping|peyek|sambal|sambel)\b/i;
+
+      (this.admin.main_menus || []).forEach(row => {
+        let { body } = this.extractPrice(row.value || '');
+        const dashIdx = body.indexOf(' - ');
+        if (dashIdx > 0) body = body.slice(dashIdx + 3).trim();
+        if (!body.includes('+')) return;
+        body.split('+').forEach(rawPart => {
+          const ex = this.extractPrice(rawPart);
+          const cleanTitle = this.extractPrice(this.toTitleCaseMenu(ex.body)).body;
+          if (!cleanTitle || skipRe.test(cleanTitle)) return;
+          const key = cleanTitle.toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          if (nasiRe.test(cleanTitle)) nasiList.push(`${cleanTitle} ${ex.compactTag || '(5k)'}`);
+          else if (sayurRe.test(cleanTitle)) sayurList.push(`${cleanTitle} ${ex.compactTag || '(3k)'}`);
+          else laukList.push(`${cleanTitle} ${ex.compactTag || '(8k)'}`);
+        });
+      });
+      return [...nasiList, ...laukList, ...sayurList];
     },
 
     customPriceHint(co) {
@@ -1292,7 +1376,6 @@ function app() {
       const payload = {
         global_quota: Math.max(0, parseInt(this.admin.global_quota, 10) || 0),
         main_menus: this.admin.main_menus.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
-        alacarte_menus: this.admin.alacarte_menus.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
         side_menus: this.admin.side_menus.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
         custom_options: this.admin.custom_options.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
         qr_url: this.admin.qr_url || '',
@@ -1346,7 +1429,7 @@ function app() {
       const s = this.summary;
       const lines = [
         '*REKAP PESANAN MBG ORDERING SYSTEM*',
-        '📅 ' + this.todayLabel(),
+        '📅 Untuk: ' + this.orderDateLabel(),
         '',
         `Kuota Terpakai: *${s.total}* / ${s.quota} slot (${s.package_total || 0} paket + ${s.lauk_alacarte || 0} lauk ala carte • ${s.order_count || 0} pemesan)`,
       ];
@@ -1397,6 +1480,14 @@ function app() {
       } catch { this.notify('Gagal menyalin rekap', 'error'); }
     },
 
+    orderDateLabel() {
+      if (this.config && this.config.order_date_label) return this.config.order_date_label;
+      const days = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+      const t = new Date();
+      t.setDate(t.getDate() + 1);
+      return `${days[t.getDay()]}, ${t.getDate()} ${months[t.getMonth()]} ${t.getFullYear()}`;
+    },
     todayLabel() { return new Date().toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }); },
     timeOf(ts) { return (ts || '').slice(11, 16) || '-'; },
   };

@@ -129,8 +129,82 @@ type Summary struct {
 // isLaukAlacarte determines whether an Ala Carte item counts toward the daily Lauk/Paket quota.
 // True when the item title contains "Lauk" (case-insensitive) OR does NOT start with non-lauk staples
 // like Nasi, Sayur, Tumis, Krupuk/Kerupuk, Sambal, Kuah (so e.g. "Ayam Rendang (8k)" also counts if admin omits "Lauk").
-var nonLaukPrefix = regexp.MustCompile(`(?i)^(nasi|sayur|tumis|capcay|sop|sup|bening|krupuk|kerupuk|emping|peyek|sambal|sambel|kuah|lalap|lalapan)\b`)
+var nonLaukPrefix = regexp.MustCompile(`(?i)^(nasi|sayur|tumis|capcay|sop|sup|bening|oseng|cah|urap|pecel|krupuk|kerupuk|emping|peyek|sambal|sambel|kuah|lalap|lalapan)\b`)
+var sayurPrefix = regexp.MustCompile(`(?i)^(sayur|tumis|capcay|sop|sup|bening|oseng|cah|urap|pecel|lalap|lalapan)\b`)
+var nasiPrefix = regexp.MustCompile(`(?i)^nasi\b`)
+var krupukPrefix = regexp.MustCompile(`(?i)^(krupuk|kerupuk|emping|peyek)\b`)
 var laukWord = regexp.MustCompile(`(?i)\blauk\b`)
+
+var idDays = []string{"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"}
+var idMonthsShort = []string{"", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"}
+
+// formatOrderDateID returns H+1 date in Indonesian e.g. "Rabu, 25 Nov 2026".
+func formatOrderDateID(now time.Time) string {
+	t := now.AddDate(0, 0, 1)
+	return fmt.Sprintf("%s, %d %s %d", idDays[t.Weekday()], t.Day(), idMonthsShort[int(t.Month())], t.Year())
+}
+
+// deriveAlacarteFromMains automatically extracts unique Ala Carte items from Menu Paket components
+// separated by "+", deduplicating shared items across packages and assigning standard prices
+// (Nasi = 5k, Lauk = 8k, Sayur = 3k; Krupuk/Kerupuk/Sambal skipped).
+func deriveAlacarteFromMains(mains []string) []string {
+	var nasiList, laukList, sayurList []string
+	seen := map[string]bool{}
+
+	for _, m := range mains {
+		body, _, _ := extractPriceParts(m)
+		if idx := strings.Index(body, " - "); idx > 0 {
+			body = strings.TrimSpace(body[idx+3:])
+		}
+		if !strings.Contains(body, "+") {
+			continue
+		}
+		for _, rawPart := range strings.Split(body, "+") {
+			itemTitle, existingTag, _ := extractPriceParts(rawPart)
+			itemTitle = titleCaseMenu(itemTitle)
+			itemTitle, _, _ = extractPriceParts(itemTitle)
+			if itemTitle == "" {
+				continue
+			}
+			// Skip krupuk / sambal from Ala Carte (matching operational rule)
+			if krupukPrefix.MatchString(itemTitle) || regexp.MustCompile(`(?i)^(sambal|sambel)\b`).MatchString(itemTitle) {
+				continue
+			}
+			key := strings.ToLower(itemTitle)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			switch {
+			case nasiPrefix.MatchString(itemTitle):
+				tag := existingTag
+				if tag == "" {
+					tag = "(5k)"
+				}
+				nasiList = append(nasiList, itemTitle+" "+tag)
+			case sayurPrefix.MatchString(itemTitle):
+				tag := existingTag
+				if tag == "" {
+					tag = "(3k)"
+				}
+				sayurList = append(sayurList, itemTitle+" "+tag)
+			default:
+				tag := existingTag
+				if tag == "" {
+					tag = "(8k)"
+				}
+				laukList = append(laukList, itemTitle+" "+tag)
+			}
+		}
+	}
+
+	out := make([]string, 0, len(nasiList)+len(laukList)+len(sayurList))
+	out = append(out, nasiList...)
+	out = append(out, laukList...)
+	out = append(out, sayurList...)
+	return out
+}
 
 func isLaukAlacarte(name string) bool {
 	title := strings.TrimSpace(shortMenuName(name))
@@ -374,17 +448,11 @@ func seedConfig() error {
 		pin = "123456"
 	}
 	defaultMain := []string{
-		"Paket Ayam - Nasi + Ayam Rendang + Tumis Buncis Labu Siam + Krupuk (15k)",
-		"Paket Bandeng - Nasi + Bandeng Presto + Tumis Buncis Labu Siam + Krupuk (15k)",
+		"Nasi + Ayam Rica Kemangi + Tumis Toge + Krupuk (15k)",
+		"Nasi + Ikan Tongkol Balado + Tumis Toge + Krupuk (15k)",
 	}
-	// Ala Carte: pecahan menu paket (Lauk ikut memotong kuota harian)
-	defaultAlacarte := []string{
-		"Lauk Ayam Rendang (8k)",
-		"Lauk Bandeng Presto (8k)",
-		"Nasi Putih (5k)",
-		"Sayur Tumis Buncis Labu Siam (3k)",
-		"Krupuk (1k)",
-	}
+	// Ala Carte otomatis terpecah dari Menu Paket (Nasi 5k, Lauk 8k, Sayur 3k)
+	defaultAlacarte := deriveAlacarteFromMains(defaultMain)
 	// Add-ons: gorengan & menu pendamping di luar isi paket
 	defaultSides := []string{
 		"Gorengan Martabak Tahu 2pcs (3k)",
@@ -462,7 +530,10 @@ func loadConfig() (AppConfig, error) {
 	if cfg.MainMenus == nil {
 		cfg.MainMenus = []string{}
 	}
-	if cfg.AlacarteMenus == nil {
+	// Selalu sinkronkan pecahan Ala Carte otomatis dari Menu Paket bila format menggunakan "+"
+	if derived := deriveAlacarteFromMains(cfg.MainMenus); len(derived) > 0 {
+		cfg.AlacarteMenus = derived
+	} else if cfg.AlacarteMenus == nil {
 		cfg.AlacarteMenus = []string{}
 	}
 	if cfg.SideMenus == nil {
@@ -506,6 +577,15 @@ func shortMenuName(s string) string {
 	body, _, _ := extractPriceParts(s)
 	if idx := strings.Index(body, " - "); idx > 0 {
 		return strings.TrimSpace(body[:idx])
+	}
+	// If written as "Nasi + Ayam Rica Kemangi + Tumis Toge + Krupuk", extract the main Lauk as concise package name
+	if strings.Contains(body, "+") {
+		for _, part := range strings.Split(body, "+") {
+			p := strings.TrimSpace(part)
+			if p != "" && !nonLaukPrefix.MatchString(p) {
+				return "Paket " + p
+			}
+		}
 	}
 	if body != "" {
 		return body
@@ -854,6 +934,7 @@ func handleGetConfig(c *gin.Context) {
 		"qr_url":           cfg.QRURL,
 		"used":             used,
 		"remaining":        remaining,
+		"order_date_label": formatOrderDateID(time.Now().In(loc)),
 	})
 }
 
@@ -909,6 +990,12 @@ func handleUpdateConfig(c *gin.Context) {
 		}
 		b, _ := json.Marshal(list)
 		updates["main_menus_json"] = string(b)
+		// Auto-generate Ala Carte breakdown directly from Menu Paket
+		if req.AlacarteMenus == nil {
+			derived := deriveAlacarteFromMains(list)
+			ab, _ := json.Marshal(derived)
+			updates["alacarte_menus_json"] = string(ab)
+		}
 	}
 	if req.AlacarteMenus != nil {
 		b, _ := json.Marshal(cleanList(*req.AlacarteMenus, true))
