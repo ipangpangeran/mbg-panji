@@ -47,11 +47,12 @@ var (
 	db         *sql.DB
 	loc        *time.Location
 	orderMu    sync.Mutex // serialises quota check + insert
-	pinRegex   = regexp.MustCompile(`^\d{6}$`)
-	parenRegex = regexp.MustCompile(`\(([^()]+)\)\s*$`)
-	priceRegex = regexp.MustCompile(`(?i)^([+-])?\s*(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(k|rb|ribu)?$`)
-	unitRegex  = regexp.MustCompile(`(?i)^\d+\s*(k|rb|ribu|pcs|gr|gram|ml|l|bks|porsi)$`)
-	guard      = &loginGuard{fails: map[string]*failRec{}}
+	pinRegex         = regexp.MustCompile(`^\d{6}$`)
+	parenRegex       = regexp.MustCompile(`\(([^()]+)\)\s*$`)
+	priceRegex       = regexp.MustCompile(`(?i)^([+-])?\s*(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(k|rb|ribu)?$`)
+	barePriceSuffix  = regexp.MustCompile(`(?i)(?:^|\s)((?:[+-]\s*)?(?:rp\.?\s*\d+(?:[.,]\d+)?(?:\s*(?:k|rb|ribu))?|\d+(?:[.,]\d+)?\s*(?:k|rb|ribu)|[+-]\s*\d{3,}|\d{4,}))\s*$`)
+	unitRegex        = regexp.MustCompile(`(?i)^\d+\s*(k|rb|ribu|pcs|gr|gram|ml|l|bks|porsi)$`)
+	guard            = &loginGuard{fails: map[string]*failRec{}}
 )
 
 func env(key, def string) string {
@@ -159,31 +160,73 @@ func calcQuotaUsed(mains, alacartes []OrderItem) int {
 	return q
 }
 
-// parseItemPrice extracts positive or negative price modifier from trailing "(15k)", "(-4k)", "(+2k)", "(Rp 15.000)".
+// extractPriceParts splits a menu string into (bodyWithoutPrice, normalizedTag, priceInIDR).
+// Supports both parenthesized "(5k)", "(-4k)", "(Rp 15.000)" AND bare trailing "5k", "10k", "-4k", "Rp 15.000", "15000".
+func extractPriceParts(raw string) (body string, tag string, price int) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", "", 0
+	}
+	parseToken := func(tok string) (string, int, bool) {
+		pm := priceRegex.FindStringSubmatch(strings.TrimSpace(tok))
+		if len(pm) < 4 {
+			return "", 0, false
+		}
+		sign := 1
+		if pm[1] == "-" {
+			sign = -1
+		}
+		numStr := strings.ReplaceAll(pm[2], ".", "")
+		numStr = strings.ReplaceAll(numStr, ",", ".")
+		val, err := strconv.ParseFloat(numStr, 64)
+		if err != nil {
+			return "", 0, false
+		}
+		if pm[3] != "" {
+			val *= 1000
+		}
+		absIDR := int(math.Round(val))
+		// Format canonical compact tag e.g. "(15k)" or "(-4k)"
+		prefix := ""
+		if sign < 0 {
+			prefix = "-"
+		} else if pm[1] == "+" {
+			prefix = "+"
+		}
+		var compact string
+		if absIDR >= 1000 && absIDR%1000 == 0 {
+			compact = fmt.Sprintf("(%s%dk)", prefix, absIDR/1000)
+		} else if absIDR >= 1000 && absIDR%100 == 0 {
+			compact = fmt.Sprintf("(%s%.1fk)", prefix, float64(absIDR)/1000.0)
+		} else {
+			compact = fmt.Sprintf("(%s%d)", prefix, absIDR)
+		}
+		return compact, sign * absIDR, true
+	}
+
+	// 1. Check parenthesized trailing price e.g. "Nasi Putih (5k)"
+	if locIdx := parenRegex.FindStringSubmatchIndex(s); locIdx != nil {
+		inside := s[locIdx[2]:locIdx[3]]
+		if normTag, p, ok := parseToken(inside); ok {
+			return strings.TrimSpace(s[:locIdx[0]]), normTag, p
+		}
+	}
+	// 2. Check bare trailing price e.g. "nasi putih 5k", "lauk ayam 10k", "tanpa nasi -4k"
+	if locIdx := barePriceSuffix.FindStringSubmatchIndex(s); locIdx != nil {
+		b := strings.TrimSpace(s[:locIdx[0]])
+		tok := s[locIdx[2]:locIdx[3]]
+		if b != "" {
+			if normTag, p, ok := parseToken(tok); ok {
+				return b, normTag, p
+			}
+		}
+	}
+	return s, "", 0
+}
+
 func parseItemPrice(raw string) int {
-	m := parenRegex.FindStringSubmatch(strings.TrimSpace(raw))
-	if len(m) < 2 {
-		return 0
-	}
-	inside := strings.TrimSpace(m[1])
-	pm := priceRegex.FindStringSubmatch(inside)
-	if len(pm) < 4 {
-		return 0
-	}
-	sign := 1
-	if pm[1] == "-" {
-		sign = -1
-	}
-	numStr := strings.ReplaceAll(pm[2], ".", "")
-	numStr = strings.ReplaceAll(numStr, ",", ".")
-	val, err := strconv.ParseFloat(numStr, 64)
-	if err != nil {
-		return 0
-	}
-	if pm[3] != "" {
-		val *= 1000
-	}
-	return sign * int(math.Round(val))
+	_, _, p := extractPriceParts(raw)
+	return p
 }
 
 func calcOrderTotal(mains, alacartes, sides, customs []OrderItem) int {
@@ -221,20 +264,17 @@ func formatIDR(n int) string {
 	return "Rp " + string(out)
 }
 
-// titleCaseMenu capitalizes the first letter of each word while keeping unit suffixes like "(15k)", "(-4k)", "2pcs" tidy.
+// titleCaseMenu capitalizes each word and auto-normalizes trailing prices like "nasi 5k" -> "Nasi (5k)".
 func titleCaseMenu(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if s == "" {
 		return ""
 	}
+	body, normTag, _ := extractPriceParts(s)
 	suffix := ""
-	if m := parenRegex.FindStringIndex(s); m != nil {
-		rawTag := strings.TrimSpace(s[m[0]:])
-		inside := strings.TrimSpace(rawTag[1 : len(rawTag)-1])
-		if priceRegex.MatchString(inside) {
-			suffix = " (" + strings.ToLower(strings.ReplaceAll(inside, " ", "")) + ")"
-			s = strings.TrimSpace(s[:m[0]])
-		}
+	if normTag != "" {
+		suffix = " " + normTag
+		s = body
 	}
 
 	words := strings.Split(s, " ")
@@ -463,7 +503,7 @@ func parseOrderItems(raw string) []OrderItem {
 }
 
 func shortMenuName(s string) string {
-	body := strings.TrimSpace(parenRegex.ReplaceAllString(s, ""))
+	body, _, _ := extractPriceParts(s)
 	if idx := strings.Index(body, " - "); idx > 0 {
 		return strings.TrimSpace(body[:idx])
 	}

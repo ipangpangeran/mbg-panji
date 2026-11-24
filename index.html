@@ -560,10 +560,10 @@
 
         <div class="glass rounded-3xl shadow-card p-5 space-y-6">
           <template x-for="group in [
-            {key:'main_menus', label:'Menu Paket', hint:'Komplit • Akhiri harga mis. (15k)', icon:'inventory_2', ph:'cth: Paket Ayam - Nasi + Ayam Rendang (15k)'},
-            {key:'alacarte_menus', label:'Menu Ala Carte (Pecahan Paket)', hint:'Item Lauk otomatis memotong kuota harian • Nasi/Sayur/Krupuk tidak potong kuota', icon:'dinner_dining', ph:'cth: Lauk Ayam Rendang (8k) atau Sayur Tumis (3k)'},
-            {key:'side_menus', label:'Menu Add-ons (Gorengan / Pendamping)', hint:'Menu tambahan di luar paket • Beri harga mis. (3k) / (5k)', icon:'add_circle', ph:'cth: Gorengan 2pcs (3k) atau Orek Tempe (3k)'},
-            {key:'custom_options', label:'Opsi Custom Paket', hint:'Beri (-4k) / (+2k) jika mengubah harga paket', icon:'tune', ph:'cth: Tanpa Nasi (-4k)'}
+            {key:'main_menus', label:'Menu Paket', hint:'Tulis harga di akhir mis. 15k (otomatis rapi)', icon:'inventory_2', ph:'cth: paket ayam - nasi + ayam rendang 15k'},
+            {key:'alacarte_menus', label:'Menu Ala Carte (Pecahan Paket)', hint:'Cukup tulis mis. lauk ayam 8k / nasi 5k (Lauk otomatis potong kuota)', icon:'dinner_dining', ph:'cth: lauk ayam rendang 8k atau sayur tumis 3k'},
+            {key:'side_menus', label:'Menu Add-ons (Gorengan / Pendamping)', hint:'Cukup tulis mis. gorengan 2pcs 3k / orek tempe 3k', icon:'add_circle', ph:'cth: gorengan 2pcs 3k atau orek tempe 3k'},
+            {key:'custom_options', label:'Opsi Custom Paket', hint:'Tulis -4k / +2k jika mengubah harga paket', icon:'tune', ph:'cth: tanpa nasi -4k'}
           ]" :key="group.key">
             <div class="space-y-2">
               <div class="flex items-center justify-between gap-2">
@@ -921,30 +921,56 @@ function app() {
       return (this.config.quota_alacartes || []).includes(a);
     },
 
-    menuParts(raw) {
-      const str = String(raw || '').trim();
-      let priceNum = 0, priceLabel = '', signedLabel = '';
-      let body = str;
+    // Parse trailing price whether written as "(5k)", "5k", "10k", "-4k", "(Rp 15.000)", or "15000"
+    extractPrice(raw) {
+      const str = String(raw || '').replace(/\s+/g, ' ').trim();
+      if (!str) return { body: '', priceNum: 0, priceLabel: '', signedLabel: '', compactTag: '' };
 
+      const parseToken = (tok) => {
+        const km = String(tok || '').trim().match(/^([+-])?\s*(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(k|rb|ribu)?$/i);
+        if (!km) return null;
+        const sign = km[1] === '-' ? -1 : 1;
+        const prefix = km[1] === '-' ? '-' : (km[1] === '+' ? '+' : '');
+        const numRaw = km[2].replace(/\./g, '').replace(',', '.');
+        const val = parseFloat(numRaw);
+        if (isNaN(val)) return null;
+        const absVal = km[3] ? Math.round(val * 1000) : Math.round(val);
+        const priceNum = sign * absVal;
+        const fmtAbs = absVal >= 1000 ? 'Rp ' + absVal.toLocaleString('id-ID') : String(tok).trim();
+        let compact;
+        if (absVal >= 1000 && absVal % 1000 === 0) compact = `(${prefix}${absVal / 1000}k)`;
+        else if (absVal >= 1000 && absVal % 100 === 0) compact = `(${prefix}${(absVal / 1000).toFixed(1)}k)`;
+        else compact = `(${prefix}${absVal})`;
+        return {
+          priceNum,
+          priceLabel: sign < 0 ? '-' + fmtAbs : fmtAbs,
+          signedLabel: sign < 0 ? '-' + fmtAbs : '+' + fmtAbs,
+          compactTag: compact,
+        };
+      };
+
+      // 1. Parenthesized trailing price e.g. "Nasi Putih (5k)"
       const pm = str.match(/\(([^()]+)\)\s*$/);
       if (pm) {
-        const inside = pm[1].trim();
-        const km = inside.match(/^([+-])?\s*(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(k|rb|ribu)?$/i);
-        if (km) {
-          const sign = km[1] === '-' ? -1 : 1;
-          const numRaw = km[2].replace(/\./g, '').replace(',', '.');
-          const val = parseFloat(numRaw);
-          if (!isNaN(val)) {
-            const absVal = km[3] ? Math.round(val * 1000) : Math.round(val);
-            priceNum = sign * absVal;
-            const fmtAbs = absVal >= 1000 ? 'Rp ' + absVal.toLocaleString('id-ID') : inside;
-            priceLabel = sign < 0 ? '-' + fmtAbs : fmtAbs;
-            signedLabel = sign < 0 ? '-' + fmtAbs : '+' + fmtAbs;
-            body = str.slice(0, pm.index).trim();
-          }
+        const res = parseToken(pm[1]);
+        if (res) return Object.assign({ body: str.slice(0, pm.index).trim() }, res);
+      }
+
+      // 2. Bare trailing price e.g. "nasi putih 5k", "gorengan 2pcs 3k", "tanpa nasi -4k"
+      const bm = str.match(/(?:^|\s)((?:[+-]\s*)?(?:rp\.?\s*\d+(?:[.,]\d+)?(?:\s*(?:k|rb|ribu))?|\d+(?:[.,]\d+)?\s*(?:k|rb|ribu)|[+-]\s*\d{3,}|\d{4,}))\s*$/i);
+      if (bm) {
+        const body = str.slice(0, bm.index).trim();
+        if (body) {
+          const res = parseToken(bm[1]);
+          if (res) return Object.assign({ body }, res);
         }
       }
 
+      return { body: str, priceNum: 0, priceLabel: '', signedLabel: '', compactTag: '' };
+    },
+
+    menuParts(raw) {
+      const { body, priceLabel, signedLabel, priceNum } = this.extractPrice(raw);
       let title = body, desc = '';
       const dashIdx = body.indexOf(' - ');
       if (dashIdx > 0) {
@@ -968,16 +994,11 @@ function app() {
     },
 
     toTitleCaseMenu(s) {
-      s = String(s || '').replace(/\s+/g, ' ').trim();
-      if (!s) return '';
-      let suffix = '';
-      const pm = s.match(/\(([^()]+)\)\s*$/);
-      if (pm && /^([+-])?\s*(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(k|rb|ribu)?$/i.test(pm[1].trim())) {
-        suffix = ' (' + pm[1].trim().toLowerCase().replace(/\s+/g, '') + ')';
-        s = s.slice(0, pm.index).trim();
-      }
+      const { body, compactTag } = this.extractPrice(s);
+      if (!body) return '';
+      const suffix = compactTag ? ' ' + compactTag : '';
       const unitRe = /^\d+\s*(k|rb|ribu|pcs|gr|gram|ml|l|bks|porsi)$/i;
-      const titled = s.split(' ').map(w => {
+      const titled = body.split(' ').map(w => {
         if (!w || ['-', '+', '/', '&'].includes(w)) return w;
         if (unitRe.test(w)) return w.toLowerCase();
         return w.replace(/(^|[\/(\-])([a-zA-ZÀ-ÿ])/g, (_, sep, ch) => sep + ch.toUpperCase());
