@@ -1,0 +1,21 @@
+# Panji MBG — Docker Compose
+#
+# Nginx: Configure Nginx to proxy / to this container
+#   location / { proxy_pass http://127.0.0.1:8080; ... }
+#   (see README.md for the full server block)
+
+services:
+  panji-mbg:
+    build: .
+    image: panji-mbg:latest
+    container_name: panji-mbg
+    restart: unless-stopped
+    # Default as requested. If Nginx runs on the same host and you don't want
+    # the port publicly reachable, change to "127.0.0.1:8080:8080".
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data   # SQLite database (app.db) persists here
+    environment:
+      - TZ=Asia/Jakarta
+      - ADMIN_PIN=123456   # Only used on first run (when DB is empty). Change it!

@@ -1,0 +1,1163 @@
+// Panji MBG — lightweight food ordering app.
+// Single-file backend: SQLite (modernc, pure Go), Gin REST API, Excel export.
+package main
+
+import (
+	"crypto/subtle"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	_ "time/tzdata" // embed tz database so Asia/Jakarta works on minimal alpine images
+
+	"github.com/gin-gonic/gin"
+	"github.com/xuri/excelize/v2"
+	_ "modernc.org/sqlite"
+)
+
+// ---------------------------------------------------------------------------
+// Settings & globals
+// ---------------------------------------------------------------------------
+
+const (
+	timeLayout    = "2006-01-02 15:04:05"
+	maxBodyBytes  = 3 << 20 // 3 MB (allows base64 QR image in config)
+	maxNameLen    = 60
+	maxMenuLen    = 150
+	maxNoteLen    = 200
+	maxMenuItems  = 50
+	maxItemQty    = 100
+	maxLoginFails = 5
+	lockDuration  = 5 * time.Minute
+)
+
+var (
+	db       *sql.DB
+	loc      *time.Location
+	orderMu  sync.Mutex // serialises quota check + insert
+	pinRegex = regexp.MustCompile(`^\d{6}$`)
+	guard    = &loginGuard{fails: map[string]*failRec{}}
+)
+
+func env(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+type AppConfig struct {
+	IsOpen        bool     `json:"is_open"`
+	GlobalQuota   int      `json:"global_quota"`
+	MainMenus     []string `json:"main_menus"`
+	SideMenus     []string `json:"side_menus"`
+	CustomOptions []string `json:"custom_options"`
+	QRURL         string   `json:"qr_url"`
+	AdminPIN      string   `json:"-"`
+}
+
+type OrderItem struct {
+	Name string `json:"name"`
+	Qty  int    `json:"qty"`
+}
+
+type Order struct {
+	ID            int64       `json:"id"`
+	Timestamp     string      `json:"timestamp"`
+	Name          string      `json:"name"`
+	MainMenus     []OrderItem `json:"main_menus"`
+	MainMenu      string      `json:"main_menu"` // Formatted text e.g. "2x Paket Ayam, 1x Paket Bandeng"
+	SideMenus     []OrderItem `json:"side_menus"`
+	CustomOptions []string    `json:"custom_options"`
+	CustomNote    string      `json:"custom_note"`
+	PaymentMethod string      `json:"payment_method"`
+	Status        string      `json:"status"`
+}
+
+type CountItem struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type Summary struct {
+	Total           int         `json:"total"`        // Total main portions (against quota)
+	OrderCount      int         `json:"order_count"`  // Total customer transactions
+	Quota           int         `json:"quota"`
+	Remaining       int         `json:"remaining"`
+	IsOpen          bool        `json:"is_open"`
+	ByMainMenu      []CountItem `json:"by_main_menu"`
+	BySideMenu      []CountItem `json:"by_side_menu"`
+	ByCustomOption  []CountItem `json:"by_custom_option"`
+	CustomOrderCnt  int         `json:"custom_order_count"`
+	ByPayment       []CountItem `json:"by_payment"`
+	GeneratedAt     string      `json:"generated_at"`
+}
+
+// ---------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------
+
+func openDB(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	d, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	d.SetMaxOpenConns(1) // SQLite: single writer, keeps things simple & safe
+	if err := d.Ping(); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+func migrate() error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS Config (
+			id    INTEGER PRIMARY KEY,
+			key   TEXT UNIQUE,
+			value TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS Orders (
+			id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp           DATETIME,
+			name                TEXT,
+			main_menu           TEXT,
+			main_menus_json     TEXT,
+			side_menus_json     TEXT,
+			custom_options_json TEXT,
+			custom_note         TEXT,
+			payment_method      TEXT,
+			status              TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_orders_ts ON Orders(timestamp)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			return err
+		}
+	}
+	// Auto-migrate existing DBs created with earlier versions
+	alterCols := []string{
+		`ALTER TABLE Orders ADD COLUMN main_menus_json TEXT DEFAULT ''`,
+		`ALTER TABLE Orders ADD COLUMN custom_options_json TEXT DEFAULT '[]'`,
+		`ALTER TABLE Orders ADD COLUMN custom_note TEXT DEFAULT ''`,
+	}
+	for _, s := range alterCols {
+		_, _ = db.Exec(s) // ignore duplicate column error
+	}
+	return nil
+}
+
+// seedConfig inserts default values for any missing key (idempotent).
+func seedConfig() error {
+	pin := env("ADMIN_PIN", "123456")
+	if !pinRegex.MatchString(pin) {
+		log.Printf("WARNING: ADMIN_PIN env is not 6 digits, falling back to 123456")
+		pin = "123456"
+	}
+	defaultMain := []string{
+		"Paket Ayam - Nasi + Ayam Rendang + Tumis Buncis Labu Siam + Krupuk (15k)",
+		"Paket Bandeng - Nasi + Bandeng Presto + Tumis Buncis Labu Siam + Krupuk (15k)",
+	}
+	defaultSides := []string{
+		"Martabak Tahu 2pcs (3k)",
+		"Martabak Tahu 4pcs (5k)",
+		"Orek Tempe (3k)",
+		"Terong Balado (3k)",
+	}
+	defaultCustom := []string{
+		"Tanpa Nasi",
+		"Tanpa Kerupuk",
+		"Tanpa Sayur/Tumis",
+		"Nasi Setengah",
+	}
+	mainMenus, _ := json.Marshal(defaultMain)
+	sideMenus, _ := json.Marshal(defaultSides)
+	customOpts, _ := json.Marshal(defaultCustom)
+
+	defaults := [][2]string{
+		{"is_open", "true"},
+		{"global_quota", "50"},
+		{"admin_pin", pin},
+		{"main_menus_json", string(mainMenus)},
+		{"side_menus_json", string(sideMenus)},
+		{"custom_options_json", string(customOpts)},
+		{"qr_url", "/qris.jpg"},
+	}
+	for _, kv := range defaults {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO Config(key, value) VALUES(?, ?)`, kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	// Populate default QRIS image if qr_url is still empty in an existing DB
+	_, _ = db.Exec(`UPDATE Config SET value = '/qris.jpg' WHERE key = 'qr_url' AND (value IS NULL OR value = '')`)
+
+	// Upgrade untouched initial seed from v1 if no orders have been placed yet
+	var cnt int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM Orders`).Scan(&cnt); err == nil && cnt == 0 {
+		var curMain string
+		_ = db.QueryRow(`SELECT value FROM Config WHERE key = 'main_menus_json'`).Scan(&curMain)
+		if curMain == `["Paket Ayam","Paket Bandeng"]` {
+			_, _ = db.Exec(`UPDATE Config SET value = ? WHERE key = 'main_menus_json'`, string(mainMenus))
+			_, _ = db.Exec(`UPDATE Config SET value = ? WHERE key = 'side_menus_json'`, string(sideMenus))
+		}
+	}
+	return nil
+}
+
+func loadConfig() (AppConfig, error) {
+	rows, err := db.Query(`SELECT key, value FROM Config`)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	defer rows.Close()
+	m := map[string]string{}
+	for rows.Next() {
+		var k string
+		var v sql.NullString
+		if err := rows.Scan(&k, &v); err != nil {
+			return AppConfig{}, err
+		}
+		m[k] = v.String
+	}
+	if err := rows.Err(); err != nil {
+		return AppConfig{}, err
+	}
+
+	cfg := AppConfig{
+		IsOpen:   m["is_open"] == "true",
+		QRURL:    m["qr_url"],
+		AdminPIN: m["admin_pin"],
+	}
+	cfg.GlobalQuota, _ = strconv.Atoi(m["global_quota"])
+	_ = json.Unmarshal([]byte(m["main_menus_json"]), &cfg.MainMenus)
+	_ = json.Unmarshal([]byte(m["side_menus_json"]), &cfg.SideMenus)
+	_ = json.Unmarshal([]byte(m["custom_options_json"]), &cfg.CustomOptions)
+	if cfg.MainMenus == nil {
+		cfg.MainMenus = []string{}
+	}
+	if cfg.SideMenus == nil {
+		cfg.SideMenus = []string{}
+	}
+	if cfg.CustomOptions == nil {
+		cfg.CustomOptions = []string{}
+	}
+	return cfg, nil
+}
+
+func parseOrderItems(raw string) []OrderItem {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return []OrderItem{}
+	}
+	var items []OrderItem
+	if err := json.Unmarshal([]byte(raw), &items); err == nil && items != nil {
+		out := []OrderItem{}
+		for _, it := range items {
+			if it.Name != "" && it.Qty > 0 {
+				out = append(out, it)
+			}
+		}
+		return out
+	}
+	// Backward compatibility: array of strings from v1
+	var strs []string
+	if err := json.Unmarshal([]byte(raw), &strs); err == nil {
+		out := []OrderItem{}
+		for _, s := range strs {
+			if s != "" {
+				out = append(out, OrderItem{Name: s, Qty: 1})
+			}
+		}
+		return out
+	}
+	return []OrderItem{}
+}
+
+func formatItems(items []OrderItem) string {
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.Qty > 0 && it.Name != "" {
+			parts = append(parts, fmt.Sprintf("%dx %s", it.Qty, shortMenuName(it.Name)))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func shortMenuName(s string) string {
+	// Keep concise display when full description is separated by " - "
+	if idx := strings.Index(s, " - "); idx > 0 {
+		return strings.TrimSpace(s[:idx])
+	}
+	return s
+}
+
+func formatCustom(opts []string, note string) string {
+	parts := append([]string{}, opts...)
+	if strings.TrimSpace(note) != "" {
+		parts = append(parts, strings.TrimSpace(note))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func countUsedPortions() (int, error) {
+	orders, err := listOrders()
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, o := range orders {
+		for _, m := range o.MainMenus {
+			total += m.Qty
+		}
+	}
+	return total, nil
+}
+
+func listOrders() ([]Order, error) {
+	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, payment_method, status
+		FROM Orders ORDER BY timestamp DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Order{}
+	for rows.Next() {
+		var o Order
+		var ts, name, mainMenu, mainsJSON, sidesJSON, customOptsJSON, customNote, pay, status sql.NullString
+		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &sidesJSON, &customOptsJSON, &customNote, &pay, &status); err != nil {
+			return nil, err
+		}
+		o.Timestamp = normalizeTS(ts.String)
+		o.Name = name.String
+		o.MainMenus = parseOrderItems(mainsJSON.String)
+		if len(o.MainMenus) == 0 && strings.TrimSpace(mainMenu.String) != "" {
+			o.MainMenus = []OrderItem{{Name: mainMenu.String, Qty: 1}}
+		}
+		o.MainMenu = formatItems(o.MainMenus)
+		if o.MainMenu == "" {
+			o.MainMenu = mainMenu.String
+		}
+		o.SideMenus = parseOrderItems(sidesJSON.String)
+		_ = json.Unmarshal([]byte(customOptsJSON.String), &o.CustomOptions)
+		if o.CustomOptions == nil {
+			o.CustomOptions = []string{}
+		}
+		o.CustomNote = customNote.String
+		o.PaymentMethod = pay.String
+		o.Status = status.String
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// normalizeTS makes timestamps consistent regardless of how the driver returns DATETIME.
+func normalizeTS(s string) string {
+	for _, layout := range []string{timeLayout, time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05 -0700 MST"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Format(timeLayout)
+		}
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func cleanList(in []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, s := range in {
+		s = strings.Join(strings.Fields(s), " ")
+		if s == "" {
+			continue
+		}
+		if r := []rune(s); len(r) > maxMenuLen {
+			s = string(r[:maxMenuLen])
+		}
+		key := strings.ToLower(s)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, s)
+		if len(out) >= maxMenuItems {
+			break
+		}
+	}
+	return out
+}
+
+func contains(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+func paymentLabel(p string) string {
+	switch p {
+	case "qris":
+		return "QRIS"
+	case "cash":
+		return "Cash"
+	}
+	return p
+}
+
+func buildSummary(cfg AppConfig, orders []Order) Summary {
+	mainCount := map[string]int{}
+	sideCount := map[string]int{}
+	customCount := map[string]int{}
+	payCount := map[string]int{}
+	totalPortions := 0
+	customOrderCnt := 0
+
+	for _, o := range orders {
+		for _, m := range o.MainMenus {
+			mainCount[m.Name] += m.Qty
+			totalPortions += m.Qty
+		}
+		for _, s := range o.SideMenus {
+			sideCount[s.Name] += s.Qty
+		}
+		hasCustom := len(o.CustomOptions) > 0 || strings.TrimSpace(o.CustomNote) != ""
+		if hasCustom {
+			customOrderCnt++
+		}
+		for _, c := range o.CustomOptions {
+			customCount[c]++
+		}
+		payCount[o.PaymentMethod]++
+	}
+
+	// Keep configured order first, then any historical items no longer in config.
+	ordered := func(conf []string, counts map[string]int) []CountItem {
+		res := []CountItem{}
+		used := map[string]bool{}
+		for _, name := range conf {
+			res = append(res, CountItem{Name: name, Count: counts[name]})
+			used[name] = true
+		}
+		extra := []string{}
+		for name := range counts {
+			if !used[name] {
+				extra = append(extra, name)
+			}
+		}
+		sort.Strings(extra)
+		for _, name := range extra {
+			res = append(res, CountItem{Name: name, Count: counts[name]})
+		}
+		return res
+	}
+	remaining := cfg.GlobalQuota - totalPortions
+	if remaining < 0 {
+		remaining = 0
+	}
+	return Summary{
+		Total:          totalPortions,
+		OrderCount:     len(orders),
+		Quota:          cfg.GlobalQuota,
+		Remaining:      remaining,
+		IsOpen:         cfg.IsOpen,
+		ByMainMenu:     ordered(cfg.MainMenus, mainCount),
+		BySideMenu:     ordered(cfg.SideMenus, sideCount),
+		ByCustomOption: ordered(cfg.CustomOptions, customCount),
+		CustomOrderCnt: customOrderCnt,
+		ByPayment: []CountItem{
+			{Name: "Cash", Count: payCount["cash"]},
+			{Name: "QRIS", Count: payCount["qris"]},
+		},
+		GeneratedAt: time.Now().In(loc).Format(timeLayout),
+	}
+}
+
+func fail(c *gin.Context, code int, msg string) {
+	c.AbortWithStatusJSON(code, gin.H{"ok": false, "error": msg})
+}
+
+// ---------------------------------------------------------------------------
+// Admin auth (PIN in X-Admin-Pin header) + brute-force guard
+// ---------------------------------------------------------------------------
+
+type failRec struct {
+	count int
+	until time.Time
+}
+
+type loginGuard struct {
+	mu    sync.Mutex
+	fails map[string]*failRec
+}
+
+func (g *loginGuard) locked(ip string) (bool, time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if r, ok := g.fails[ip]; ok && time.Now().Before(r.until) {
+		return true, time.Until(r.until)
+	}
+	return false, 0
+}
+
+func (g *loginGuard) fail(ip string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	r, ok := g.fails[ip]
+	if !ok || (!r.until.IsZero() && time.Now().After(r.until)) {
+		r = &failRec{}
+		g.fails[ip] = r
+	}
+	r.count++
+	if r.count >= maxLoginFails {
+		r.until = time.Now().Add(lockDuration)
+		r.count = 0
+	}
+}
+
+func (g *loginGuard) reset(ip string) {
+	g.mu.Lock()
+	delete(g.fails, ip)
+	g.mu.Unlock()
+}
+
+// checkPin validates a PIN against the DB, applying the lockout guard.
+// Returns (httpStatus, errorMessage); status 0 means OK.
+func checkPin(c *gin.Context, pin string) (int, string) {
+	ip := c.ClientIP()
+	if l, d := guard.locked(ip); l {
+		return http.StatusTooManyRequests, fmt.Sprintf("Terlalu banyak percobaan. Coba lagi dalam %d menit.", int(d.Minutes())+1)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return http.StatusInternalServerError, "Gagal membaca konfigurasi"
+	}
+	if !pinRegex.MatchString(pin) || subtle.ConstantTimeCompare([]byte(pin), []byte(cfg.AdminPIN)) != 1 {
+		guard.fail(ip)
+		return http.StatusUnauthorized, "PIN salah"
+	}
+	guard.reset(ip)
+	return 0, ""
+}
+
+func adminAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if code, msg := checkPin(c, c.GetHeader("X-Admin-Pin")); code != 0 {
+			fail(c, code, msg)
+			return
+		}
+		c.Next()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+// GET /api/config (public — never exposes the PIN)
+func handleGetConfig(c *gin.Context) {
+	cfg, err := loadConfig()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
+		return
+	}
+	used, err := countUsedPortions()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal menghitung pesanan")
+		return
+	}
+	remaining := cfg.GlobalQuota - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"is_open":        cfg.IsOpen,
+		"global_quota":   cfg.GlobalQuota,
+		"main_menus":     cfg.MainMenus,
+		"side_menus":     cfg.SideMenus,
+		"custom_options": cfg.CustomOptions,
+		"qr_url":         cfg.QRURL,
+		"used":           used,
+		"remaining":      remaining,
+	})
+}
+
+// POST /api/login
+func handleLogin(c *gin.Context) {
+	var req struct {
+		PIN string `json:"pin"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, "Format permintaan tidak valid")
+		return
+	}
+	if code, msg := checkPin(c, strings.TrimSpace(req.PIN)); code != 0 {
+		fail(c, code, msg)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// POST /api/config (admin) — partial update, only provided fields are changed.
+func handleUpdateConfig(c *gin.Context) {
+	var req struct {
+		IsOpen        *bool     `json:"is_open"`
+		GlobalQuota   *int      `json:"global_quota"`
+		MainMenus     *[]string `json:"main_menus"`
+		SideMenus     *[]string `json:"side_menus"`
+		CustomOptions *[]string `json:"custom_options"`
+		QRURL         *string   `json:"qr_url"`
+		AdminPIN      *string   `json:"admin_pin"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, "Format permintaan tidak valid")
+		return
+	}
+
+	updates := map[string]string{}
+	if req.IsOpen != nil {
+		updates["is_open"] = strconv.FormatBool(*req.IsOpen)
+	}
+	if req.GlobalQuota != nil {
+		if *req.GlobalQuota < 0 || *req.GlobalQuota > 100000 {
+			fail(c, http.StatusBadRequest, "Kuota harus antara 0 dan 100000")
+			return
+		}
+		updates["global_quota"] = strconv.Itoa(*req.GlobalQuota)
+	}
+	if req.MainMenus != nil {
+		list := cleanList(*req.MainMenus)
+		if len(list) == 0 {
+			fail(c, http.StatusBadRequest, "Minimal harus ada 1 menu utama")
+			return
+		}
+		b, _ := json.Marshal(list)
+		updates["main_menus_json"] = string(b)
+	}
+	if req.SideMenus != nil {
+		b, _ := json.Marshal(cleanList(*req.SideMenus))
+		updates["side_menus_json"] = string(b)
+	}
+	if req.CustomOptions != nil {
+		b, _ := json.Marshal(cleanList(*req.CustomOptions))
+		updates["custom_options_json"] = string(b)
+	}
+	if req.QRURL != nil {
+		u := strings.TrimSpace(*req.QRURL)
+		if u != "" && !(strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://") ||
+			strings.HasPrefix(u, "data:image/") || strings.HasPrefix(u, "/")) {
+			fail(c, http.StatusBadRequest, "URL QRIS harus diawali http(s)://, / atau data:image/")
+			return
+		}
+		updates["qr_url"] = u
+	}
+	if req.AdminPIN != nil && strings.TrimSpace(*req.AdminPIN) != "" {
+		p := strings.TrimSpace(*req.AdminPIN)
+		if !pinRegex.MatchString(p) {
+			fail(c, http.StatusBadRequest, "PIN harus 6 digit angka")
+			return
+		}
+		updates["admin_pin"] = p
+	}
+	if len(updates) == 0 {
+		fail(c, http.StatusBadRequest, "Tidak ada perubahan")
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal menyimpan konfigurasi")
+		return
+	}
+	for k, v := range updates {
+		if _, err := tx.Exec(`INSERT INTO Config(key, value) VALUES(?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+			_ = tx.Rollback()
+			fail(c, http.StatusInternalServerError, "Gagal menyimpan konfigurasi")
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal menyimpan konfigurasi")
+		return
+	}
+	_, pinChanged := updates["admin_pin"]
+	c.JSON(http.StatusOK, gin.H{"ok": true, "pin_changed": pinChanged})
+}
+
+// POST /api/order (public)
+func handleCreateOrder(c *gin.Context) {
+	var req struct {
+		Name          string          `json:"name"`
+		MainMenu      string          `json:"main_menu"`       // Legacy single-item fallback
+		MainMenus     []OrderItem     `json:"main_menus"`      // Preferred: [{name, qty}]
+		SideMenusRaw  json.RawMessage `json:"side_menus"`      // Accepts [{name, qty}] or legacy ["name"]
+		CustomOptions []string        `json:"custom_options"`  // Quick custom tags e.g. ["Tanpa Nasi"]
+		CustomNote    string          `json:"custom_note"`     // Free-text custom request
+		PaymentMethod string          `json:"payment_method"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, "Format permintaan tidak valid")
+		return
+	}
+	name := strings.Join(strings.Fields(req.Name), " ")
+	if name == "" {
+		fail(c, http.StatusBadRequest, "Nama wajib diisi")
+		return
+	}
+	if len([]rune(name)) > maxNameLen {
+		fail(c, http.StatusBadRequest, fmt.Sprintf("Nama maksimal %d karakter", maxNameLen))
+		return
+	}
+	pay := strings.ToLower(strings.TrimSpace(req.PaymentMethod))
+	if pay != "cash" && pay != "qris" {
+		fail(c, http.StatusBadRequest, "Metode pembayaran tidak valid")
+		return
+	}
+
+	note := strings.Join(strings.Fields(req.CustomNote), " ")
+	if r := []rune(note); len(r) > maxNoteLen {
+		note = string(r[:maxNoteLen])
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
+		return
+	}
+	if !cfg.IsOpen {
+		fail(c, http.StatusForbidden, "Maaf, warung sedang tutup")
+		return
+	}
+
+	// Normalize main_menus
+	mainsInput := req.MainMenus
+	if len(mainsInput) == 0 && strings.TrimSpace(req.MainMenu) != "" {
+		mainsInput = []OrderItem{{Name: strings.TrimSpace(req.MainMenu), Qty: 1}}
+	}
+	mainsMap := map[string]int{}
+	mainsOrder := []string{}
+	totalPortions := 0
+	for _, it := range mainsInput {
+		if it.Qty <= 0 {
+			continue
+		}
+		if it.Qty > maxItemQty {
+			fail(c, http.StatusBadRequest, fmt.Sprintf("Jumlah porsi maksimal %d per menu", maxItemQty))
+			return
+		}
+		if !contains(cfg.MainMenus, it.Name) {
+			fail(c, http.StatusBadRequest, "Menu utama tidak tersedia: "+it.Name)
+			return
+		}
+		if _, seen := mainsMap[it.Name]; !seen {
+			mainsOrder = append(mainsOrder, it.Name)
+		}
+		mainsMap[it.Name] += it.Qty
+		totalPortions += it.Qty
+	}
+	if totalPortions <= 0 {
+		fail(c, http.StatusBadRequest, "Pilih minimal 1 porsi menu utama")
+		return
+	}
+	mains := make([]OrderItem, 0, len(mainsOrder))
+	for _, mName := range mainsOrder {
+		mains = append(mains, OrderItem{Name: mName, Qty: mainsMap[mName]})
+	}
+
+	// Normalize side_menus
+	sidesParsed := parseOrderItems(string(req.SideMenusRaw))
+	sidesMap := map[string]int{}
+	sidesOrder := []string{}
+	for _, it := range sidesParsed {
+		if it.Qty <= 0 {
+			continue
+		}
+		if it.Qty > maxItemQty {
+			fail(c, http.StatusBadRequest, fmt.Sprintf("Jumlah add-on maksimal %d per item", maxItemQty))
+			return
+		}
+		if !contains(cfg.SideMenus, it.Name) {
+			fail(c, http.StatusBadRequest, "Add-on tidak tersedia: "+it.Name)
+			return
+		}
+		if _, seen := sidesMap[it.Name]; !seen {
+			sidesOrder = append(sidesOrder, it.Name)
+		}
+		sidesMap[it.Name] += it.Qty
+	}
+	sides := make([]OrderItem, 0, len(sidesOrder))
+	for _, sName := range sidesOrder {
+		sides = append(sides, OrderItem{Name: sName, Qty: sidesMap[sName]})
+	}
+
+	// Validate custom_options
+	customOpts := []string{}
+	for _, co := range cleanList(req.CustomOptions) {
+		if !contains(cfg.CustomOptions, co) {
+			fail(c, http.StatusBadRequest, "Opsi custom tidak tersedia: "+co)
+			return
+		}
+		customOpts = append(customOpts, co)
+	}
+
+	used, err := countUsedPortions()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal menghitung pesanan")
+		return
+	}
+	remaining := cfg.GlobalQuota - used
+	if remaining <= 0 {
+		fail(c, http.StatusConflict, "Maaf, kuota hari ini sudah habis")
+		return
+	}
+	if totalPortions > remaining {
+		fail(c, http.StatusConflict, fmt.Sprintf("Maaf, sisa kuota hanya %d porsi (kamu memesan %d porsi)", remaining, totalPortions))
+		return
+	}
+
+	mainsJSON, _ := json.Marshal(mains)
+	sidesJSON, _ := json.Marshal(sides)
+	customOptsJSON, _ := json.Marshal(customOpts)
+	mainMenuSummary := formatItems(mains)
+	ts := time.Now().In(loc).Format(timeLayout)
+
+	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, payment_method, status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ts, name, mainMenuSummary, string(mainsJSON), string(sidesJSON), string(customOptsJSON), note, pay, "baru")
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal menyimpan pesanan")
+		return
+	}
+	id, _ := res.LastInsertId()
+	c.JSON(http.StatusCreated, gin.H{
+		"ok":      true,
+		"message": "Terima kasih, " + name + "!",
+		"order": Order{
+			ID:            id,
+			Timestamp:     ts,
+			Name:          name,
+			MainMenus:     mains,
+			MainMenu:      mainMenuSummary,
+			SideMenus:     sides,
+			CustomOptions: customOpts,
+			CustomNote:    note,
+			PaymentMethod: pay,
+			Status:        "baru",
+		},
+		"remaining": remaining - totalPortions,
+	})
+}
+
+// GET /api/orders (admin)
+func handleListOrders(c *gin.Context) {
+	orders, err := listOrders()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca pesanan")
+		return
+	}
+	c.JSON(http.StatusOK, orders)
+}
+
+// DELETE /api/orders (admin)
+func handleResetOrders(c *gin.Context) {
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	tx, err := db.Begin()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal mereset data")
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM Orders`); err != nil {
+		_ = tx.Rollback()
+		fail(c, http.StatusInternalServerError, "Gagal mereset data")
+		return
+	}
+	// Restart order numbering from 1.
+	_, _ = tx.Exec(`DELETE FROM sqlite_sequence WHERE name = 'Orders'`)
+	if err := tx.Commit(); err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal mereset data")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// GET /api/summary (admin)
+func handleSummary(c *gin.Context) {
+	cfg, err := loadConfig()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
+		return
+	}
+	orders, err := listOrders()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca pesanan")
+		return
+	}
+	c.JSON(http.StatusOK, buildSummary(cfg, orders))
+}
+
+// GET /api/export/excel (admin)
+func handleExportExcel(c *gin.Context) {
+	cfg, err := loadConfig()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
+		return
+	}
+	orders, err := listOrders()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca pesanan")
+		return
+	}
+	f, err := buildExcel(cfg, orders)
+	if err != nil {
+		log.Printf("excel: %v", err)
+		fail(c, http.StatusInternalServerError, "Gagal membuat file Excel")
+		return
+	}
+	defer f.Close()
+
+	filename := "panji-mbg-" + time.Now().In(loc).Format("20060102-1504") + ".xlsx"
+	c.Header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
+	c.Header("Cache-Control", "no-store")
+	c.Status(http.StatusOK)
+	if err := f.Write(c.Writer); err != nil {
+		log.Printf("excel write: %v", err)
+	}
+}
+
+func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
+	f := excelize.NewFile()
+	const sOrders, sSummary = "Pesanan", "Ringkasan"
+	if err := f.SetSheetName("Sheet1", sOrders); err != nil {
+		return nil, err
+	}
+	if _, err := f.NewSheet(sSummary); err != nil {
+		return nil, err
+	}
+
+	header, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Color: "FFFFFF", Family: "Calibri", Size: 11},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"10B981"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border:    borders("0E9F6E"),
+	})
+	cell, _ := f.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{Vertical: "center", WrapText: true},
+		Border:    borders("E2E8F0"),
+	})
+	title, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 14, Color: "006C49"}})
+	bold, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}, Border: borders("E2E8F0")})
+	section, _ := f.NewStyle(&excelize.Style{
+		Font:   &excelize.Font{Bold: true, Color: "00422B"},
+		Fill:   excelize.Fill{Type: "pattern", Color: []string{"D1FAE5"}, Pattern: 1},
+		Border: borders("A7F3D0"),
+	})
+
+	// --- Sheet: Pesanan ---
+	cols := []interface{}{"No", "Waktu", "Nama", "Menu Utama (Qty)", "Total Porsi", "Add-ons (Qty)", "Custom / Catatan", "Pembayaran", "Status"}
+	_ = f.SetSheetRow(sOrders, "A1", &cols)
+	_ = f.SetCellStyle(sOrders, "A1", "I1", header)
+	_ = f.SetRowHeight(sOrders, 1, 22)
+	// Oldest first in the spreadsheet so numbering follows order sequence.
+	for i := range orders {
+		o := orders[len(orders)-1-i]
+		row := i + 2
+		portions := 0
+		for _, m := range o.MainMenus {
+			portions += m.Qty
+		}
+		sides := formatItems(o.SideMenus)
+		if sides == "" {
+			sides = "-"
+		}
+		custom := formatCustom(o.CustomOptions, o.CustomNote)
+		if custom == "" {
+			custom = "-"
+		}
+		vals := []interface{}{i + 1, o.Timestamp, o.Name, o.MainMenu, portions, sides, custom, paymentLabel(o.PaymentMethod), o.Status}
+		ref, _ := excelize.CoordinatesToCellName(1, row)
+		_ = f.SetSheetRow(sOrders, ref, &vals)
+	}
+	if n := len(orders); n > 0 {
+		last, _ := excelize.CoordinatesToCellName(9, n+1)
+		_ = f.SetCellStyle(sOrders, "A2", last, cell)
+		_ = f.AutoFilter(sOrders, "A1:"+last, nil)
+	}
+	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 22, "D": 34, "E": 12, "F": 32, "G": 30, "H": 13, "I": 10} {
+		_ = f.SetColWidth(sOrders, col, col, w)
+	}
+	_ = f.SetPanes(sOrders, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
+
+	// --- Sheet: Ringkasan ---
+	sum := buildSummary(cfg, orders)
+	r := 1
+	put := func(a, b interface{}, style int) {
+		ca, _ := excelize.CoordinatesToCellName(1, r)
+		cb, _ := excelize.CoordinatesToCellName(2, r)
+		_ = f.SetCellValue(sSummary, ca, a)
+		if b != nil {
+			_ = f.SetCellValue(sSummary, cb, b)
+		}
+		if style != 0 {
+			_ = f.SetCellStyle(sSummary, ca, cb, style)
+		}
+		r++
+	}
+	put("Rekap Pesanan Panji MBG", nil, 0)
+	_ = f.SetCellStyle(sSummary, "A1", "A1", title)
+	put("Dibuat", sum.GeneratedAt, 0)
+	r++
+	put("Total Porsi Terjual", sum.Total, bold)
+	put("Jumlah Pemesan", sum.OrderCount, cell)
+	put("Pesanan Custom", sum.CustomOrderCnt, cell)
+	put("Kuota Global", sum.Quota, cell)
+	put("Sisa Slot", sum.Remaining, cell)
+	r++
+	block := func(label string, items []CountItem) {
+		put(label, "Jumlah", section)
+		for _, it := range items {
+			put(it.Name, it.Count, cell)
+		}
+		r++
+	}
+	block("Menu Utama (Porsi)", sum.ByMainMenu)
+	block("Add-ons (Qty)", sum.BySideMenu)
+	block("Kategori Custom", sum.ByCustomOption)
+	block("Pembayaran (Transaksi)", sum.ByPayment)
+	_ = f.SetColWidth(sSummary, "A", "A", 54)
+	_ = f.SetColWidth(sSummary, "B", "B", 22)
+
+	f.SetActiveSheet(0)
+	return f, nil
+}
+
+func borders(color string) []excelize.Border {
+	return []excelize.Border{
+		{Type: "left", Color: color, Style: 1},
+		{Type: "right", Color: color, Style: 1},
+		{Type: "top", Color: color, Style: 1},
+		{Type: "bottom", Color: color, Style: 1},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+func main() {
+	var err error
+	loc, err = time.LoadLocation(env("TZ", "Asia/Jakarta"))
+	if err != nil {
+		log.Printf("WARNING: invalid TZ, using UTC: %v", err)
+		loc = time.UTC
+	}
+
+	dbPath := env("DB_PATH", filepath.Join("data", "app.db"))
+	db, err = openDB(dbPath)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(); err != nil {
+		log.Fatalf("migrate: %v", err)
+	}
+	if err := seedConfig(); err != nil {
+		log.Fatalf("seed: %v", err)
+	}
+
+	if os.Getenv(gin.EnvGinMode) == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	r := gin.New()
+	r.Use(gin.Logger(), gin.Recovery())
+	// Trust loopback + private ranges (Nginx on host / Docker bridge) for X-Forwarded-For.
+	_ = r.SetTrustedProxies([]string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"})
+	r.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("X-Frame-Options", "SAMEORIGIN")
+		c.Next()
+	})
+
+	staticDir := env("STATIC_DIR", ".")
+	indexPath := filepath.Join(staticDir, "index.html")
+	qrisPath := filepath.Join(staticDir, "qris.jpg")
+	serveIndex := func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.File(indexPath)
+	}
+	r.GET("/", serveIndex)
+	r.GET("/index.html", serveIndex)
+	r.GET("/qris.jpg", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=3600")
+		c.File(qrisPath)
+	})
+	r.GET("/healthz", func(c *gin.Context) {
+		if err := db.Ping(); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	api := r.Group("/api")
+	api.Use(func(c *gin.Context) { c.Header("Cache-Control", "no-store"); c.Next() })
+	{
+		api.GET("/config", handleGetConfig)
+		api.POST("/login", handleLogin)
+		api.POST("/order", handleCreateOrder)
+
+		admin := api.Group("", adminAuth())
+		admin.POST("/config", handleUpdateConfig)
+		admin.GET("/orders", handleListOrders)
+		admin.DELETE("/orders", handleResetOrders)
+		admin.GET("/summary", handleSummary)
+		admin.GET("/export/excel", handleExportExcel)
+	}
+	r.NoRoute(func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			fail(c, http.StatusNotFound, "Endpoint tidak ditemukan")
+			return
+		}
+		serveIndex(c)
+	})
+
+	addr := ":" + env("PORT", "8080")
+	log.Printf("Panji MBG listening on %s (db: %s, tz: %s)", addr, dbPath, loc)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("server: %v", err)
+	}
+}

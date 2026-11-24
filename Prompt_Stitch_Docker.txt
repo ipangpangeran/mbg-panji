@@ -1,0 +1,57 @@
+# Role
+You are a Senior UI/UX Designer specializing in Modern, Minimalist Web Interfaces.
+
+# Goal
+Design "Panji MBG" using **Arc UI** style principles. Elegant, clean, and highly functional.
+
+# Style Guide
+- **Aesthetic:** "Glassmorphism" light, soft gradients, rounded corners (12px+), subtle shadows.
+- **Colors:**
+  - Primary: #10B981 (Emerald Green for Food/Success).
+  - Background: #F3F4F6 (Light Gray).
+  - Surface: #FFFFFF with soft shadow.
+  - Text: #1F2937 (Dark Gray).
+  - Alert: #EF4444 (Red).
+  - Warning: #F59E0B (Amber).
+- **Typography:** Inter or SF Pro. Large headings, readable body.
+- **Components:**
+  - Cards with white background and soft shadow.
+  - Inputs with rounded borders, focus ring.
+  - Badges for status (Green/Red).
+
+# Screens to Design (3 Views)
+
+## 1. Customer Order View
+- **Layout:** Centered Card on a clean background.
+- **Header:**
+  - Simple "Panji MBG" logo/text.
+  - Status Badge: 🟢 "Buka" or 🔴 "Tutup".
+- **Form Card:**
+  1. **Nama**: Large, clear text input.
+  2. **Menu**: Dropdown with nice styling.
+  3. **Add-ons**: Grid of checkboxes with icons or simple text.
+  4. **Payment**: Toggle or Radio buttons (Cash / QRIS).
+     - If QRIS: Show a clean box with QR Code placeholder.
+  5. **Submit Button**: Full width, Emerald Green, rounded, large.
+- **Feedback:** Toast notification at top right for success.
+
+## 2. Admin Login
+- **Layout:** Centered Card.
+- **Input:** 6-digit numeric PIN input (large font).
+- **Button:** "Masuk".
+
+## 3. Admin Dashboard
+- **Layout:** Clean, spacious layout.
+- **Section 1: Controls**
+  - Toggle: "Warung Buka/Tutup".
+  - Input: "Kuota Global".
+  - Section: "Menu Settings" (Clean list of inputs).
+  - Button: "Simpan".
+- **Section 2: Reports**
+  - **Summary Cards:** 3 small cards showing: Total Orders, Ayam Count, Bandeng Count.
+  - **Actions:** Two buttons: "Salin Rekap WA" (Copy Icon), "Export Excel" (Download Icon).
+  - **Order Table:** Clean table with Name, Menu, Time.
+  - **Reset Button:** Subtle "Reset Data" button.
+
+# Output Format
+Provide detailed description of components, spacing, colors, and interaction states.

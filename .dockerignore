@@ -1,0 +1,9 @@
+data/
+*.db
+*.db-*
+*.md
+*.txt
+stitch_warung_mbg_order_system/
+.git/
+*.exe
+panji-mbg
