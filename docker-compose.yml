@@ -10,10 +10,10 @@ services:
     image: panji-mbg:latest
     container_name: panji-mbg
     restart: unless-stopped
-    # Default as requested. If Nginx runs on the same host and you don't want
-    # the port publicly reachable, change to "127.0.0.1:8080:8080".
+    # Bound to localhost so only Nginx on the host can reach port 8080
+    # (prevents Docker from exposing port 8080 directly past UFW).
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./data:/app/data   # SQLite database (app.db) persists here
     environment:

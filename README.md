@@ -185,7 +185,7 @@ mkdir -p data
 ```
 Edit `docker-compose.yml` bila perlu:
 - Ubah `ADMIN_PIN=123456` ke 6 digit PIN pilihanmu sebelum menjalankan pertama kali.
-- Jika Nginx berada di server yang sama, disarankan mengubah `ports` menjadi `"127.0.0.1:8080:8080"` agar port `8080` tidak terekspos langsung ke publik.
+- Port sudah dikonfigurasi aman ke `"127.0.0.1:8080:8080"` agar hanya bisa diakses melalui Nginx di host. *(Lihat juga [Deployment_Guide.md](Deployment_Guide.md) untuk panduan operasional lengkap).*
 
 ### 3. Build & Jalankan Container
 ```bash
