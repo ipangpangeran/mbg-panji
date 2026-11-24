@@ -69,6 +69,7 @@ type AppConfig struct {
 	IsOpen        bool     `json:"is_open"`
 	GlobalQuota   int      `json:"global_quota"`
 	MainMenus     []string `json:"main_menus"`
+	AlacarteMenus []string `json:"alacarte_menus"`
 	SideMenus     []string `json:"side_menus"`
 	CustomOptions []string `json:"custom_options"`
 	QRURL         string   `json:"qr_url"`
@@ -86,10 +87,12 @@ type Order struct {
 	Name          string      `json:"name"`
 	MainMenus     []OrderItem `json:"main_menus"`
 	MainMenu      string      `json:"main_menu"`
+	AlacarteMenus []OrderItem `json:"alacarte_menus"`
 	SideMenus     []OrderItem `json:"side_menus"`
 	CustomItems   []OrderItem `json:"custom_items"`
 	CustomOptions []string    `json:"custom_options"` // formatted labels for backward compatibility
 	CustomNote    string      `json:"custom_note"`
+	QuotaUsed     int         `json:"quota_used"` // MainMenus qty + Lauk Ala Carte qty
 	TotalPrice    int         `json:"total_price"`
 	PaymentMethod string      `json:"payment_method"`
 	Status        string      `json:"status"`
@@ -101,13 +104,16 @@ type CountItem struct {
 }
 
 type Summary struct {
-	Total          int         `json:"total"`         // Total main portions (against quota)
-	OrderCount     int         `json:"order_count"`   // Total customer transactions
-	TotalRevenue   int         `json:"total_revenue"` // Sum of TotalPrice across orders
+	Total          int         `json:"total"`          // Total quota slots used (Paket + Lauk Ala Carte)
+	PackageTotal   int         `json:"package_total"`  // Total Menu Paket portions
+	LaukAlacarte   int         `json:"lauk_alacarte"`  // Total Lauk Ala Carte portions (quota-consuming)
+	OrderCount     int         `json:"order_count"`    // Total customer transactions
+	TotalRevenue   int         `json:"total_revenue"`  // Sum of TotalPrice across orders
 	Quota          int         `json:"quota"`
 	Remaining      int         `json:"remaining"`
 	IsOpen         bool        `json:"is_open"`
 	ByMainMenu     []CountItem `json:"by_main_menu"`
+	ByAlacarteMenu []CountItem `json:"by_alacarte_menu"`
 	BySideMenu     []CountItem `json:"by_side_menu"`
 	ByCustomOption []CountItem `json:"by_custom_option"`
 	CustomOrderCnt int         `json:"custom_order_count"`
@@ -116,8 +122,42 @@ type Summary struct {
 }
 
 // ---------------------------------------------------------------------------
-// Price & Title-Case Helpers
+// Price, Quota & Title-Case Helpers
 // ---------------------------------------------------------------------------
+
+// isLaukAlacarte determines whether an Ala Carte item counts toward the daily Lauk/Paket quota.
+// True when the item title contains "Lauk" (case-insensitive) OR does NOT start with non-lauk staples
+// like Nasi, Sayur, Tumis, Krupuk/Kerupuk, Sambal, Kuah (so e.g. "Ayam Rendang (8k)" also counts if admin omits "Lauk").
+var nonLaukPrefix = regexp.MustCompile(`(?i)^(nasi|sayur|tumis|capcay|sop|sup|bening|krupuk|kerupuk|emping|peyek|sambal|sambel|kuah|lalap|lalapan)\b`)
+var laukWord = regexp.MustCompile(`(?i)\blauk\b`)
+
+func isLaukAlacarte(name string) bool {
+	title := strings.TrimSpace(shortMenuName(name))
+	if title == "" {
+		return false
+	}
+	if laukWord.MatchString(name) {
+		return true
+	}
+	if nonLaukPrefix.MatchString(title) {
+		return false
+	}
+	// Protein dish written directly without "Lauk" prefix (e.g. "Ayam Rendang (8k)", "Bandeng Presto (8k)")
+	return true
+}
+
+func calcQuotaUsed(mains, alacartes []OrderItem) int {
+	q := 0
+	for _, m := range mains {
+		q += m.Qty
+	}
+	for _, a := range alacartes {
+		if isLaukAlacarte(a.Name) {
+			q += a.Qty
+		}
+	}
+	return q
+}
 
 // parseItemPrice extracts positive or negative price modifier from trailing "(15k)", "(-4k)", "(+2k)", "(Rp 15.000)".
 func parseItemPrice(raw string) int {
@@ -146,10 +186,13 @@ func parseItemPrice(raw string) int {
 	return sign * int(math.Round(val))
 }
 
-func calcOrderTotal(mains, sides, customs []OrderItem) int {
+func calcOrderTotal(mains, alacartes, sides, customs []OrderItem) int {
 	total := 0
 	for _, m := range mains {
 		total += m.Qty * parseItemPrice(m.Name)
+	}
+	for _, a := range alacartes {
+		total += a.Qty * parseItemPrice(a.Name)
 	}
 	for _, s := range sides {
 		total += s.Qty * parseItemPrice(s.Name)
@@ -184,7 +227,6 @@ func titleCaseMenu(s string) string {
 	if s == "" {
 		return ""
 	}
-	// Preserve trailing parenthesized price/tag e.g. "(15k)" or "(-4k)" cleanly
 	suffix := ""
 	if m := parenRegex.FindStringIndex(s); m != nil {
 		rawTag := strings.TrimSpace(s[m[0]:])
@@ -204,7 +246,6 @@ func titleCaseMenu(s string) string {
 			words[i] = strings.ToLower(w)
 			continue
 		}
-		// Capitalize first letter after start or '/' or '('
 		runes := []rune(w)
 		capNext := true
 		for j, r := range runes {
@@ -237,7 +278,7 @@ func openDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d.SetMaxOpenConns(1) // SQLite: single writer, keeps things simple & safe
+	d.SetMaxOpenConns(1)
 	if err := d.Ping(); err != nil {
 		return nil, err
 	}
@@ -257,6 +298,7 @@ func migrate() error {
 			name                TEXT,
 			main_menu           TEXT,
 			main_menus_json     TEXT,
+			alacarte_menus_json TEXT,
 			side_menus_json     TEXT,
 			custom_options_json TEXT,
 			custom_note         TEXT,
@@ -271,9 +313,9 @@ func migrate() error {
 			return err
 		}
 	}
-	// Auto-migrate existing DBs created with earlier versions
 	alterCols := []string{
 		`ALTER TABLE Orders ADD COLUMN main_menus_json TEXT DEFAULT ''`,
+		`ALTER TABLE Orders ADD COLUMN alacarte_menus_json TEXT DEFAULT '[]'`,
 		`ALTER TABLE Orders ADD COLUMN custom_options_json TEXT DEFAULT '[]'`,
 		`ALTER TABLE Orders ADD COLUMN custom_note TEXT DEFAULT ''`,
 		`ALTER TABLE Orders ADD COLUMN total_price INTEGER DEFAULT 0`,
@@ -295,13 +337,22 @@ func seedConfig() error {
 		"Paket Ayam - Nasi + Ayam Rendang + Tumis Buncis Labu Siam + Krupuk (15k)",
 		"Paket Bandeng - Nasi + Bandeng Presto + Tumis Buncis Labu Siam + Krupuk (15k)",
 	}
+	// Ala Carte: pecahan menu paket (Lauk ikut memotong kuota harian)
+	defaultAlacarte := []string{
+		"Lauk Ayam Rendang (8k)",
+		"Lauk Bandeng Presto (8k)",
+		"Nasi Putih (5k)",
+		"Sayur Tumis Buncis Labu Siam (3k)",
+		"Krupuk (1k)",
+	}
+	// Add-ons: gorengan & menu pendamping di luar isi paket
 	defaultSides := []string{
-		"Martabak Tahu 2pcs (3k)",
-		"Martabak Tahu 4pcs (5k)",
+		"Gorengan Martabak Tahu 2pcs (3k)",
+		"Gorengan Martabak Tahu 4pcs (5k)",
 		"Orek Tempe (3k)",
 		"Terong Balado (3k)",
+		"Mie Goreng (3k)",
 	}
-	// Tanpa Nasi -> potongan -4k per porsi (15k jadi 11k); opsi lain tetap Rp 0 (15k)
 	defaultCustom := []string{
 		"Tanpa Nasi (-4k)",
 		"Nasi Setengah",
@@ -309,6 +360,7 @@ func seedConfig() error {
 		"Tanpa Sayur/Tumis",
 	}
 	mainMenus, _ := json.Marshal(defaultMain)
+	alacarteMenus, _ := json.Marshal(defaultAlacarte)
 	sideMenus, _ := json.Marshal(defaultSides)
 	customOpts, _ := json.Marshal(defaultCustom)
 
@@ -317,6 +369,7 @@ func seedConfig() error {
 		{"global_quota", "50"},
 		{"admin_pin", pin},
 		{"main_menus_json", string(mainMenus)},
+		{"alacarte_menus_json", string(alacarteMenus)},
 		{"side_menus_json", string(sideMenus)},
 		{"custom_options_json", string(customOpts)},
 		{"qr_url", "/qris.jpg"},
@@ -328,7 +381,6 @@ func seedConfig() error {
 	}
 	_, _ = db.Exec(`UPDATE Config SET value = '/qris.jpg' WHERE key = 'qr_url' AND (value IS NULL OR value = '')`)
 
-	// Upgrade untouched default custom_options from earlier seed ("Tanpa Nasi" -> "Tanpa Nasi (-4k)")
 	var curCustom string
 	if err := db.QueryRow(`SELECT value FROM Config WHERE key = 'custom_options_json'`).Scan(&curCustom); err == nil {
 		if curCustom == `["Tanpa Nasi","Tanpa Kerupuk","Tanpa Sayur/Tumis","Nasi Setengah"]` {
@@ -364,10 +416,14 @@ func loadConfig() (AppConfig, error) {
 	}
 	cfg.GlobalQuota, _ = strconv.Atoi(m["global_quota"])
 	_ = json.Unmarshal([]byte(m["main_menus_json"]), &cfg.MainMenus)
+	_ = json.Unmarshal([]byte(m["alacarte_menus_json"]), &cfg.AlacarteMenus)
 	_ = json.Unmarshal([]byte(m["side_menus_json"]), &cfg.SideMenus)
 	_ = json.Unmarshal([]byte(m["custom_options_json"]), &cfg.CustomOptions)
 	if cfg.MainMenus == nil {
 		cfg.MainMenus = []string{}
+	}
+	if cfg.AlacarteMenus == nil {
+		cfg.AlacarteMenus = []string{}
 	}
 	if cfg.SideMenus == nil {
 		cfg.SideMenus = []string{}
@@ -393,7 +449,6 @@ func parseOrderItems(raw string) []OrderItem {
 		}
 		return out
 	}
-	// Backward compatibility: array of strings from earlier versions
 	var strs []string
 	if err := json.Unmarshal([]byte(raw), &strs); err == nil {
 		out := []OrderItem{}
@@ -408,7 +463,6 @@ func parseOrderItems(raw string) []OrderItem {
 }
 
 func shortMenuName(s string) string {
-	// Strip trailing price "(15k)" or "(-4k)" for concise order summaries if needed
 	body := strings.TrimSpace(parenRegex.ReplaceAllString(s, ""))
 	if idx := strings.Index(body, " - "); idx > 0 {
 		return strings.TrimSpace(body[:idx])
@@ -447,22 +501,20 @@ func formatCustomItems(items []OrderItem, note string) string {
 	return strings.Join(parts, ", ")
 }
 
-func countUsedPortions() (int, error) {
+func countUsedQuota() (int, error) {
 	orders, err := listOrders()
 	if err != nil {
 		return 0, err
 	}
 	total := 0
 	for _, o := range orders {
-		for _, m := range o.MainMenus {
-			total += m.Qty
-		}
+		total += o.QuotaUsed
 	}
 	return total, nil
 }
 
 func listOrders() ([]Order, error) {
-	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status
+	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status
 		FROM Orders ORDER BY timestamp DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -471,21 +523,19 @@ func listOrders() ([]Order, error) {
 	out := []Order{}
 	for rows.Next() {
 		var o Order
-		var ts, name, mainMenu, mainsJSON, sidesJSON, customOptsJSON, customNote, pay, status sql.NullString
+		var ts, name, mainMenu, mainsJSON, alacarteJSON, sidesJSON, customOptsJSON, customNote, pay, status sql.NullString
 		var totalPrice sql.NullInt64
-		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &sidesJSON, &customOptsJSON, &customNote, &totalPrice, &pay, &status); err != nil {
+		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &alacarteJSON, &sidesJSON, &customOptsJSON, &customNote, &totalPrice, &pay, &status); err != nil {
 			return nil, err
 		}
 		o.Timestamp = normalizeTS(ts.String)
 		o.Name = name.String
 		o.MainMenus = parseOrderItems(mainsJSON.String)
-		if len(o.MainMenus) == 0 && strings.TrimSpace(mainMenu.String) != "" {
+		o.AlacarteMenus = parseOrderItems(alacarteJSON.String)
+		if len(o.MainMenus) == 0 && len(o.AlacarteMenus) == 0 && strings.TrimSpace(mainMenu.String) != "" && mainMenu.String != "-" {
 			o.MainMenus = []OrderItem{{Name: mainMenu.String, Qty: 1}}
 		}
 		o.MainMenu = formatItems(o.MainMenus)
-		if o.MainMenu == "" {
-			o.MainMenu = mainMenu.String
-		}
 		o.SideMenus = parseOrderItems(sidesJSON.String)
 		o.CustomItems = parseOrderItems(customOptsJSON.String)
 		o.CustomOptions = make([]string, 0, len(o.CustomItems))
@@ -497,9 +547,10 @@ func listOrders() ([]Order, error) {
 			}
 		}
 		o.CustomNote = customNote.String
+		o.QuotaUsed = calcQuotaUsed(o.MainMenus, o.AlacarteMenus)
 		o.TotalPrice = int(totalPrice.Int64)
 		if o.TotalPrice == 0 {
-			o.TotalPrice = calcOrderTotal(o.MainMenus, o.SideMenus, o.CustomItems)
+			o.TotalPrice = calcOrderTotal(o.MainMenus, o.AlacarteMenus, o.SideMenus, o.CustomItems)
 		}
 		o.PaymentMethod = pay.String
 		o.Status = status.String
@@ -569,17 +620,26 @@ func paymentLabel(p string) string {
 
 func buildSummary(cfg AppConfig, orders []Order) Summary {
 	mainCount := map[string]int{}
+	alacarteCount := map[string]int{}
 	sideCount := map[string]int{}
 	customCount := map[string]int{}
 	payCount := map[string]int{}
-	totalPortions := 0
+	packagePortions := 0
+	laukAlacarte := 0
+	totalQuotaUsed := 0
 	totalRevenue := 0
 	customOrderCnt := 0
 
 	for _, o := range orders {
 		for _, m := range o.MainMenus {
 			mainCount[m.Name] += m.Qty
-			totalPortions += m.Qty
+			packagePortions += m.Qty
+		}
+		for _, a := range o.AlacarteMenus {
+			alacarteCount[a.Name] += a.Qty
+			if isLaukAlacarte(a.Name) {
+				laukAlacarte += a.Qty
+			}
 		}
 		for _, s := range o.SideMenus {
 			sideCount[s.Name] += s.Qty
@@ -591,6 +651,7 @@ func buildSummary(cfg AppConfig, orders []Order) Summary {
 		for _, c := range o.CustomItems {
 			customCount[c.Name] += c.Qty
 		}
+		totalQuotaUsed += o.QuotaUsed
 		totalRevenue += o.TotalPrice
 		payCount[o.PaymentMethod]++
 	}
@@ -614,18 +675,21 @@ func buildSummary(cfg AppConfig, orders []Order) Summary {
 		}
 		return res
 	}
-	remaining := cfg.GlobalQuota - totalPortions
+	remaining := cfg.GlobalQuota - totalQuotaUsed
 	if remaining < 0 {
 		remaining = 0
 	}
 	return Summary{
-		Total:          totalPortions,
+		Total:          totalQuotaUsed,
+		PackageTotal:   packagePortions,
+		LaukAlacarte:   laukAlacarte,
 		OrderCount:     len(orders),
 		TotalRevenue:   totalRevenue,
 		Quota:          cfg.GlobalQuota,
 		Remaining:      remaining,
 		IsOpen:         cfg.IsOpen,
 		ByMainMenu:     ordered(cfg.MainMenus, mainCount),
+		ByAlacarteMenu: ordered(cfg.AlacarteMenus, alacarteCount),
 		BySideMenu:     ordered(cfg.SideMenus, sideCount),
 		ByCustomOption: ordered(cfg.CustomOptions, customCount),
 		CustomOrderCnt: customOrderCnt,
@@ -723,7 +787,7 @@ func handleGetConfig(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
 		return
 	}
-	used, err := countUsedPortions()
+	used, err := countUsedQuota()
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menghitung pesanan")
 		return
@@ -732,15 +796,24 @@ func handleGetConfig(c *gin.Context) {
 	if remaining < 0 {
 		remaining = 0
 	}
+	// Tell frontend which alacarte items consume Lauk quota so both sides stay 100% consistent
+	quotaAlacartes := []string{}
+	for _, a := range cfg.AlacarteMenus {
+		if isLaukAlacarte(a) {
+			quotaAlacartes = append(quotaAlacartes, a)
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"is_open":        cfg.IsOpen,
-		"global_quota":   cfg.GlobalQuota,
-		"main_menus":     cfg.MainMenus,
-		"side_menus":     cfg.SideMenus,
-		"custom_options": cfg.CustomOptions,
-		"qr_url":         cfg.QRURL,
-		"used":           used,
-		"remaining":      remaining,
+		"is_open":          cfg.IsOpen,
+		"global_quota":     cfg.GlobalQuota,
+		"main_menus":       cfg.MainMenus,
+		"alacarte_menus":   cfg.AlacarteMenus,
+		"quota_alacartes":  quotaAlacartes,
+		"side_menus":       cfg.SideMenus,
+		"custom_options":   cfg.CustomOptions,
+		"qr_url":           cfg.QRURL,
+		"used":             used,
+		"remaining":        remaining,
 	})
 }
 
@@ -766,6 +839,7 @@ func handleUpdateConfig(c *gin.Context) {
 		IsOpen        *bool     `json:"is_open"`
 		GlobalQuota   *int      `json:"global_quota"`
 		MainMenus     *[]string `json:"main_menus"`
+		AlacarteMenus *[]string `json:"alacarte_menus"`
 		SideMenus     *[]string `json:"side_menus"`
 		CustomOptions *[]string `json:"custom_options"`
 		QRURL         *string   `json:"qr_url"`
@@ -790,11 +864,15 @@ func handleUpdateConfig(c *gin.Context) {
 	if req.MainMenus != nil {
 		list := cleanList(*req.MainMenus, true)
 		if len(list) == 0 {
-			fail(c, http.StatusBadRequest, "Minimal harus ada 1 menu utama")
+			fail(c, http.StatusBadRequest, "Minimal harus ada 1 menu paket")
 			return
 		}
 		b, _ := json.Marshal(list)
 		updates["main_menus_json"] = string(b)
+	}
+	if req.AlacarteMenus != nil {
+		b, _ := json.Marshal(cleanList(*req.AlacarteMenus, true))
+		updates["alacarte_menus_json"] = string(b)
 	}
 	if req.SideMenus != nil {
 		b, _ := json.Marshal(cleanList(*req.SideMenus, true))
@@ -847,15 +925,16 @@ func handleUpdateConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "pin_changed": pinChanged})
 }
 
-// POST /api/order (public)
+// POST /api/order (public) — accepts Menu Paket, Ala Carte (standalone or combined), and Add-ons.
 func handleCreateOrder(c *gin.Context) {
 	var req struct {
 		Name             string          `json:"name"`
 		MainMenu         string          `json:"main_menu"`
 		MainMenus        []OrderItem     `json:"main_menus"`
+		AlacarteMenus    []OrderItem     `json:"alacarte_menus"`
 		SideMenusRaw     json.RawMessage `json:"side_menus"`
-		CustomItems      []OrderItem     `json:"custom_items"`   // Preferred: [{name, qty}]
-		CustomOptionsRaw json.RawMessage `json:"custom_options"` // Legacy fallback: ["name"] or [{name, qty}]
+		CustomItems      []OrderItem     `json:"custom_items"`
+		CustomOptionsRaw json.RawMessage `json:"custom_options"`
 		CustomNote       string          `json:"custom_note"`
 		PaymentMethod    string          `json:"payment_method"`
 	}
@@ -896,14 +975,14 @@ func handleCreateOrder(c *gin.Context) {
 		return
 	}
 
-	// Normalize main_menus
+	// 1. Normalize main_menus (Menu Paket)
 	mainsInput := req.MainMenus
 	if len(mainsInput) == 0 && strings.TrimSpace(req.MainMenu) != "" {
 		mainsInput = []OrderItem{{Name: strings.TrimSpace(req.MainMenu), Qty: 1}}
 	}
 	mainsMap := map[string]int{}
 	mainsOrder := []string{}
-	totalPortions := 0
+	packagePortions := 0
 	for _, it := range mainsInput {
 		if it.Qty <= 0 {
 			continue
@@ -913,25 +992,54 @@ func handleCreateOrder(c *gin.Context) {
 			return
 		}
 		if !contains(cfg.MainMenus, it.Name) {
-			fail(c, http.StatusBadRequest, "Menu utama tidak tersedia: "+it.Name)
+			fail(c, http.StatusBadRequest, "Menu paket tidak tersedia: "+it.Name)
 			return
 		}
 		if _, seen := mainsMap[it.Name]; !seen {
 			mainsOrder = append(mainsOrder, it.Name)
 		}
 		mainsMap[it.Name] += it.Qty
-		totalPortions += it.Qty
-	}
-	if totalPortions <= 0 {
-		fail(c, http.StatusBadRequest, "Pilih minimal 1 porsi menu utama")
-		return
+		packagePortions += it.Qty
 	}
 	mains := make([]OrderItem, 0, len(mainsOrder))
 	for _, mName := range mainsOrder {
 		mains = append(mains, OrderItem{Name: mName, Qty: mainsMap[mName]})
 	}
 
-	// Normalize side_menus
+	// 2. Normalize alacarte_menus (Menu Ala Carte / Pecahan Paket)
+	alaMap := map[string]int{}
+	alaOrder := []string{}
+	alaTotalQty := 0
+	for _, it := range req.AlacarteMenus {
+		if it.Qty <= 0 {
+			continue
+		}
+		if it.Qty > maxItemQty {
+			fail(c, http.StatusBadRequest, fmt.Sprintf("Jumlah ala carte maksimal %d per item", maxItemQty))
+			return
+		}
+		if !contains(cfg.AlacarteMenus, it.Name) {
+			fail(c, http.StatusBadRequest, "Menu ala carte tidak tersedia: "+it.Name)
+			return
+		}
+		if _, seen := alaMap[it.Name]; !seen {
+			alaOrder = append(alaOrder, it.Name)
+		}
+		alaMap[it.Name] += it.Qty
+		alaTotalQty += it.Qty
+	}
+	alacartes := make([]OrderItem, 0, len(alaOrder))
+	for _, aName := range alaOrder {
+		alacartes = append(alacartes, OrderItem{Name: aName, Qty: alaMap[aName]})
+	}
+
+	// Customer must select at least 1 Menu Paket OR 1 Menu Ala Carte
+	if packagePortions <= 0 && alaTotalQty <= 0 {
+		fail(c, http.StatusBadRequest, "Pilih minimal 1 Menu Paket atau Menu Ala Carte")
+		return
+	}
+
+	// 3. Normalize side_menus (Add-ons)
 	sidesParsed := parseOrderItems(string(req.SideMenusRaw))
 	sidesMap := map[string]int{}
 	sidesOrder := []string{}
@@ -957,27 +1065,29 @@ func handleCreateOrder(c *gin.Context) {
 		sides = append(sides, OrderItem{Name: sName, Qty: sidesMap[sName]})
 	}
 
-	// Normalize custom_items (each option cannot exceed total main portions)
+	// 4. Normalize custom_items (only applies to Menu Paket portions)
 	customsInput := req.CustomItems
 	if len(customsInput) == 0 && len(req.CustomOptionsRaw) > 0 {
 		customsInput = parseOrderItems(string(req.CustomOptionsRaw))
 	}
 	customsMap := map[string]int{}
 	customsOrder := []string{}
-	for _, it := range customsInput {
-		if it.Qty <= 0 {
-			continue
-		}
-		if !contains(cfg.CustomOptions, it.Name) {
-			fail(c, http.StatusBadRequest, "Opsi custom tidak tersedia: "+it.Name)
-			return
-		}
-		if _, seen := customsMap[it.Name]; !seen {
-			customsOrder = append(customsOrder, it.Name)
-		}
-		customsMap[it.Name] += it.Qty
-		if customsMap[it.Name] > totalPortions {
-			customsMap[it.Name] = totalPortions
+	if packagePortions > 0 {
+		for _, it := range customsInput {
+			if it.Qty <= 0 {
+				continue
+			}
+			if !contains(cfg.CustomOptions, it.Name) {
+				fail(c, http.StatusBadRequest, "Opsi custom tidak tersedia: "+it.Name)
+				return
+			}
+			if _, seen := customsMap[it.Name]; !seen {
+				customsOrder = append(customsOrder, it.Name)
+			}
+			customsMap[it.Name] += it.Qty
+			if customsMap[it.Name] > packagePortions {
+				customsMap[it.Name] = packagePortions
+			}
 		}
 	}
 	customs := make([]OrderItem, 0, len(customsOrder))
@@ -992,36 +1102,48 @@ func handleCreateOrder(c *gin.Context) {
 		}
 	}
 
-	used, err := countUsedPortions()
+	// 5. Quota validation: Menu Paket portions + Lauk Ala Carte portions consume daily quota
+	quotaNeeded := calcQuotaUsed(mains, alacartes)
+	used, err := countUsedQuota()
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menghitung pesanan")
 		return
 	}
 	remaining := cfg.GlobalQuota - used
-	if remaining <= 0 {
-		fail(c, http.StatusConflict, "Maaf, kuota hari ini sudah habis")
-		return
+	if remaining < 0 {
+		remaining = 0
 	}
-	if totalPortions > remaining {
-		fail(c, http.StatusConflict, fmt.Sprintf("Maaf, sisa kuota hanya %d porsi (kamu memesan %d porsi)", remaining, totalPortions))
-		return
+	if quotaNeeded > 0 {
+		if remaining <= 0 {
+			fail(c, http.StatusConflict, "Maaf, kuota lauk/paket hari ini sudah habis")
+			return
+		}
+		if quotaNeeded > remaining {
+			fail(c, http.StatusConflict, fmt.Sprintf("Maaf, sisa kuota lauk/paket hanya %d porsi (kamu memilih %d porsi)", remaining, quotaNeeded))
+			return
+		}
 	}
 
-	totalPrice := calcOrderTotal(mains, sides, customs)
+	totalPrice := calcOrderTotal(mains, alacartes, sides, customs)
 	mainsJSON, _ := json.Marshal(mains)
+	alacartesJSON, _ := json.Marshal(alacartes)
 	sidesJSON, _ := json.Marshal(sides)
 	customsJSON, _ := json.Marshal(customs)
 	mainMenuSummary := formatItems(mains)
 	ts := time.Now().In(loc).Format(timeLayout)
 
-	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ts, name, mainMenuSummary, string(mainsJSON), string(sidesJSON), string(customsJSON), note, totalPrice, pay, "baru")
+	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, total_price, payment_method, status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ts, name, mainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), note, totalPrice, pay, "baru")
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menyimpan pesanan")
 		return
 	}
 	id, _ := res.LastInsertId()
+	newRemaining := remaining - quotaNeeded
+	if newRemaining < 0 {
+		newRemaining = 0
+	}
 	c.JSON(http.StatusCreated, gin.H{
 		"ok":      true,
 		"message": "Terima kasih, " + name + "!",
@@ -1031,15 +1153,17 @@ func handleCreateOrder(c *gin.Context) {
 			Name:          name,
 			MainMenus:     mains,
 			MainMenu:      mainMenuSummary,
+			AlacarteMenus: alacartes,
 			SideMenus:     sides,
 			CustomItems:   customs,
 			CustomOptions: customLabels,
 			CustomNote:    note,
+			QuotaUsed:     quotaNeeded,
 			TotalPrice:    totalPrice,
 			PaymentMethod: pay,
 			Status:        "baru",
 		},
-		"remaining": remaining - totalPortions,
+		"remaining": newRemaining,
 	})
 }
 
@@ -1143,7 +1267,7 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	currency, _ := f.NewStyle(&excelize.Style{
 		Alignment: &excelize.Alignment{Horizontal: "right", Vertical: "center"},
 		Border:    borders("E2E8F0"),
-		NumFmt:    3, // #,##0
+		NumFmt:    3,
 	})
 	title, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 14, Color: "006C49"}})
 	bold, _ := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}, Border: borders("E2E8F0")})
@@ -1154,16 +1278,20 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	})
 
 	// --- Sheet: Pesanan ---
-	cols := []interface{}{"No", "Waktu", "Nama & Lantai", "Menu Utama (Qty)", "Total Porsi", "Add-ons (Qty)", "Custom / Catatan", "Total Tagihan (Rp)", "Pembayaran", "Status"}
+	cols := []interface{}{"No", "Waktu", "Nama & Lantai", "Menu Paket (Qty)", "Menu Ala Carte (Qty)", "Slot Kuota", "Add-ons (Qty)", "Custom / Catatan", "Total Tagihan (Rp)", "Pembayaran", "Status"}
 	_ = f.SetSheetRow(sOrders, "A1", &cols)
-	_ = f.SetCellStyle(sOrders, "A1", "J1", header)
+	_ = f.SetCellStyle(sOrders, "A1", "K1", header)
 	_ = f.SetRowHeight(sOrders, 1, 22)
 	for i := range orders {
 		o := orders[len(orders)-1-i]
 		row := i + 2
-		portions := 0
-		for _, m := range o.MainMenus {
-			portions += m.Qty
+		mains := o.MainMenu
+		if mains == "" {
+			mains = "-"
+		}
+		alacartes := formatItems(o.AlacarteMenus)
+		if alacartes == "" {
+			alacartes = "-"
 		}
 		sides := formatItems(o.SideMenus)
 		if sides == "" {
@@ -1173,18 +1301,18 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 		if custom == "" {
 			custom = "-"
 		}
-		vals := []interface{}{i + 1, o.Timestamp, o.Name, o.MainMenu, portions, sides, custom, o.TotalPrice, paymentLabel(o.PaymentMethod), o.Status}
+		vals := []interface{}{i + 1, o.Timestamp, o.Name, mains, alacartes, o.QuotaUsed, sides, custom, o.TotalPrice, paymentLabel(o.PaymentMethod), o.Status}
 		ref, _ := excelize.CoordinatesToCellName(1, row)
 		_ = f.SetSheetRow(sOrders, ref, &vals)
 	}
 	if n := len(orders); n > 0 {
-		last, _ := excelize.CoordinatesToCellName(10, n+1)
+		last, _ := excelize.CoordinatesToCellName(11, n+1)
 		_ = f.SetCellStyle(sOrders, "A2", last, cell)
-		priceEnd, _ := excelize.CoordinatesToCellName(8, n+1)
-		_ = f.SetCellStyle(sOrders, "H2", priceEnd, currency)
+		priceEnd, _ := excelize.CoordinatesToCellName(9, n+1)
+		_ = f.SetCellStyle(sOrders, "I2", priceEnd, currency)
 		_ = f.AutoFilter(sOrders, "A1:"+last, nil)
 	}
-	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 24, "D": 32, "E": 12, "F": 30, "G": 30, "H": 18, "I": 13, "J": 10} {
+	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 24, "D": 30, "E": 30, "F": 11, "G": 28, "H": 28, "I": 18, "J": 13, "K": 10} {
 		_ = f.SetColWidth(sOrders, col, col, w)
 	}
 	_ = f.SetPanes(sOrders, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
@@ -1208,12 +1336,14 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	_ = f.SetCellStyle(sSummary, "A1", "A1", title)
 	put("Dibuat", sum.GeneratedAt, 0)
 	r++
-	put("Total Porsi Terjual", sum.Total, bold)
+	put("Total Slot Kuota Terpakai (Paket + Lauk)", sum.Total, bold)
+	put("  - Porsi Menu Paket", sum.PackageTotal, cell)
+	put("  - Porsi Lauk Ala Carte", sum.LaukAlacarte, cell)
 	put("Total Estimasi Omzet", formatIDR(sum.TotalRevenue), bold)
 	put("Jumlah Pemesan", sum.OrderCount, cell)
 	put("Pesanan Custom", sum.CustomOrderCnt, cell)
 	put("Kuota Global", sum.Quota, cell)
-	put("Sisa Slot", sum.Remaining, cell)
+	put("Sisa Slot Kuota", sum.Remaining, cell)
 	r++
 	block := func(label string, items []CountItem) {
 		put(label, "Jumlah", section)
@@ -1222,7 +1352,8 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 		}
 		r++
 	}
-	block("Menu Utama (Porsi)", sum.ByMainMenu)
+	block("Menu Paket (Porsi)", sum.ByMainMenu)
+	block("Menu Ala Carte (Qty)", sum.ByAlacarteMenu)
 	block("Add-ons (Qty)", sum.BySideMenu)
 	block("Kategori Custom (Porsi)", sum.ByCustomOption)
 	block("Pembayaran (Transaksi)", sum.ByPayment)

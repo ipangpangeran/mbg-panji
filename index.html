@@ -39,17 +39,15 @@
   [x-cloak] { display: none !important; }
   html, body {
     background: #faf8ff;
-    touch-action: manipulation; /* Prevent double-tap zoom globally on mobile */
+    touch-action: manipulation;
     -webkit-text-size-adjust: 100%;
   }
   body { font-family: Inter, sans-serif; -webkit-tap-highlight-color: transparent; }
-  /* Prevent double-tap zoom when rapidly tapping + / - / PIN keypad buttons */
   button, a, label, [role="button"], [role="switch"] {
     touch-action: manipulation;
     -webkit-user-select: none;
     user-select: none;
   }
-  /* iOS Safari & mobile Chrome auto-zooms any input with font-size < 16px! Enforce >= 16px on mobile */
   @media screen and (max-width: 768px) {
     input, select, textarea {
       font-size: 16px !important;
@@ -140,25 +138,36 @@
     <div class="flex items-end justify-between gap-2">
       <div class="space-y-0.5">
         <h1 class="font-head font-semibold text-[24px] tracking-tight">Input Pesanan</h1>
-        <p class="text-sm text-on-surface-variant" x-show="config.is_open && config.remaining > 0">
-          Sisa kuota hari ini: <span class="font-bold text-primary" x-text="config.remaining + ' porsi'"></span>
+        <p class="text-sm text-on-surface-variant" x-show="config.is_open">
+          Sisa kuota lauk/paket:
+          <span class="font-bold" :class="config.remaining > 0 ? 'text-primary' : 'text-error'"
+                x-text="config.remaining + ' porsi'"></span>
         </p>
       </div>
-      <span x-show="totalMainQty > 0"
+      <span x-show="hasAnyMainOrAlacarte"
             class="px-3 py-1 rounded-full bg-emerald-50 text-emerald-800 text-xs font-bold whitespace-nowrap"
-            x-text="totalMainQty + ' porsi dipilih'"></span>
+            x-text="estimatedTotal > 0 ? formatIDR(estimatedTotal) : (totalSelectedCount + ' item')"></span>
     </div>
 
-    <!-- Closed / quota full notice -->
-    <div x-show="!canOrder" class="flex items-start gap-3 p-4 rounded-2xl bg-red-50 text-red-800">
+    <!-- Closed notice -->
+    <div x-show="!config.is_open" class="flex items-start gap-3 p-4 rounded-2xl bg-red-50 text-red-800">
       <span class="material-symbols-outlined">storefront</span>
       <div>
-        <p class="font-semibold" x-text="!config.is_open ? 'Pemesanan sedang tutup' : 'Kuota hari ini sudah habis'"></p>
+        <p class="font-semibold">Pemesanan sedang tutup</p>
         <p class="text-sm opacity-80">Silakan kembali lagi nanti.</p>
       </div>
     </div>
 
-    <form @submit.prevent="submitOrder()" class="glass rounded-3xl shadow-card p-5 space-y-6" :class="!canOrder && 'opacity-60 pointer-events-none'">
+    <!-- Lauk quota full notice (non-lauk ala carte still available if store is open) -->
+    <div x-show="config.is_open && config.remaining <= 0" class="flex items-start gap-3 p-3.5 rounded-2xl bg-amber-50 text-amber-900 border border-amber-200">
+      <span class="material-symbols-outlined text-[20px]">info</span>
+      <div class="text-xs leading-relaxed">
+        <p class="font-semibold text-sm">Kuota Lauk &amp; Menu Paket hari ini sudah habis</p>
+        <p class="opacity-85">Item Ala Carte non-lauk (seperti Nasi / Sayur / Krupuk) tetap bisa dipesan selama tersedia.</p>
+      </div>
+    </div>
+
+    <form @submit.prevent="submitOrder()" class="glass rounded-3xl shadow-card p-5 space-y-6" :class="!config.is_open && 'opacity-60 pointer-events-none'">
       <!-- 1. Nama Pemesan -->
       <div class="space-y-2">
         <label for="name" class="block text-sm font-semibold">Nama Pemesan</label>
@@ -169,11 +178,14 @@
         </div>
       </div>
 
-      <!-- 2. Pilihan Menu Utama (dengan Qty Stepper) -->
+      <!-- 2. Menu Paket -->
       <div class="space-y-2.5">
         <div class="flex items-center justify-between">
-          <span class="text-sm font-semibold">Pilihan Menu Utama</span>
-          <span class="text-xs text-primary font-semibold">Bisa pilih lebih dari 1 porsi</span>
+          <span class="text-sm font-semibold flex items-center gap-1.5">
+            <span class="material-symbols-outlined text-[18px] text-primary">inventory_2</span>
+            Menu Paket
+          </span>
+          <span class="text-xs text-primary font-semibold">Komplit • Hemat</span>
         </div>
         <div class="space-y-2.5">
           <template x-for="m in config.main_menus" :key="'main-' + m">
@@ -203,10 +215,10 @@
                   <span class="font-head font-bold text-sm min-w-[20px] text-center"
                         :class="getMainQty(m) > 0 ? 'text-primary' : 'text-slate-400'"
                         x-text="getMainQty(m)"></span>
-                  <button type="button" @click="incMain(m)" :disabled="totalMainQty >= config.remaining"
+                  <button type="button" @click="incMain(m)" :disabled="totalQuotaSelected >= config.remaining"
                           aria-label="Tambah porsi"
                           class="w-8 h-8 rounded-full flex items-center justify-center transition shadow-sm"
-                          :class="totalMainQty >= config.remaining ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-primary text-white hover:opacity-90'">
+                          :class="totalQuotaSelected >= config.remaining ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-primary text-white hover:opacity-90'">
                     <span class="material-symbols-outlined text-[16px]">add</span>
                   </button>
                 </div>
@@ -216,7 +228,52 @@
         </div>
       </div>
 
-      <!-- 3. Pilihan Add-ons (dengan Qty Stepper) -->
+      <!-- 3. Menu Ala Carte (Pecahan Menu Paket: Lauk saja, Nasi, Sayur, Krupuk) -->
+      <div class="space-y-2.5" x-show="config.alacarte_menus && config.alacarte_menus.length">
+        <div class="flex items-center justify-between gap-2">
+          <div>
+            <span class="text-sm font-semibold flex items-center gap-1.5">
+              <span class="material-symbols-outlined text-[18px] text-secondary">dinner_dining</span>
+              Menu Ala Carte (Satuan)
+            </span>
+            <p class="text-[11px] text-on-surface-variant">Bisa pesan lauk saja tanpa paket, atau tambah lauk ekstra</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <template x-for="a in config.alacarte_menus" :key="'ala-' + a">
+            <div class="p-3 rounded-2xl border flex items-center justify-between gap-2 transition-all"
+                 :class="getAlacarteQty(a) > 0 ? 'bg-blue-50/70 border-secondary/60 shadow-sm' : 'bg-surface-container-lowest border-slate-200/80 hover:bg-surface-container-low/50'">
+              <div class="min-w-0 flex-1 cursor-pointer" @click="incAlacarte(a)">
+                <div class="flex items-center flex-wrap gap-1">
+                  <p class="text-sm font-semibold leading-snug text-on-surface" x-text="menuParts(a).title"></p>
+                  <span x-show="isQuotaAlacarte(a)"
+                        class="px-1.5 py-0.5 rounded bg-blue-100/80 text-secondary text-[9px] font-bold uppercase tracking-wide">Kuota Lauk</span>
+                </div>
+                <p x-show="menuParts(a).desc" class="text-[11px] text-on-surface-variant leading-tight mt-0.5" x-text="menuParts(a).desc"></p>
+                <p x-show="menuParts(a).priceLabel" class="text-xs font-bold text-secondary mt-0.5" x-text="menuParts(a).priceLabel"></p>
+              </div>
+              <div class="flex items-center gap-1.5 bg-white px-1.5 py-1 rounded-full shadow-sm border border-slate-100 flex-shrink-0">
+                <button type="button" @click="decAlacarte(a)" :disabled="getAlacarteQty(a) <= 0"
+                        class="w-7 h-7 rounded-full flex items-center justify-center transition"
+                        :class="getAlacarteQty(a) > 0 ? 'bg-surface-container text-on-surface' : 'bg-slate-100 text-slate-300 cursor-not-allowed'">
+                  <span class="material-symbols-outlined text-[15px]">remove</span>
+                </button>
+                <span class="font-head font-bold text-xs min-w-[18px] text-center"
+                      :class="getAlacarteQty(a) > 0 ? 'text-secondary' : 'text-slate-400'"
+                      x-text="getAlacarteQty(a)"></span>
+                <button type="button" @click="incAlacarte(a)"
+                        :disabled="isQuotaAlacarte(a) && totalQuotaSelected >= config.remaining"
+                        class="w-7 h-7 rounded-full flex items-center justify-center transition"
+                        :class="(isQuotaAlacarte(a) && totalQuotaSelected >= config.remaining) ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-secondary text-white hover:opacity-90'">
+                  <span class="material-symbols-outlined text-[15px]">add</span>
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- 4. Pilihan Tambahan (Add-ons: Gorengan, Orek, Terong, Mie, dll) -->
       <div class="space-y-2.5" x-show="config.side_menus.length">
         <div class="flex items-center justify-between">
           <span class="text-sm font-semibold">Pilihan Tambahan (Add-ons)</span>
@@ -250,18 +307,19 @@
         </div>
       </div>
 
-      <!-- 4. Kategori Custom (dengan Penyesuaian Harga & Qty per Porsi) -->
+      <!-- 5. Kategori Custom & Catatan -->
       <div class="space-y-2.5">
         <div class="flex items-center justify-between">
           <span class="text-sm font-semibold flex items-center gap-1.5">
             <span class="material-symbols-outlined text-[18px] text-primary">tune</span>
-            Kategori Custom
+            Custom Paket &amp; Catatan
           </span>
           <span class="text-xs text-on-surface-variant">Opsional</span>
         </div>
 
-        <!-- Custom Options Grid (mendukung pengurangan/penambahan harga mis. Tanpa Nasi -> 11k) -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2" x-show="config.custom_options && config.custom_options.length">
+        <!-- Custom Options Grid (khusus saat memilih Menu Paket) -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2"
+             x-show="totalMainQty > 0 && config.custom_options && config.custom_options.length" x-transition>
           <template x-for="co in config.custom_options" :key="'co-' + co">
             <div class="p-2.5 rounded-2xl border flex items-center justify-between gap-2 transition-all"
                  :class="getCustomQty(co) > 0 ? 'bg-amber-50/90 border-amber-400 shadow-sm' : 'bg-surface-container-lowest border-slate-200/80 hover:bg-surface-container-low/50'">
@@ -272,7 +330,6 @@
                    x-text="customPriceHint(co)"></p>
               </div>
 
-              <!-- Jika total porsi <= 1 cukup tombol centang sederhana; jika > 1 tampilkan stepper porsi -->
               <template x-if="totalMainQty <= 1">
                 <button type="button" @click="tapCustom(co)"
                         class="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 transition"
@@ -310,7 +367,7 @@
         </div>
       </div>
 
-      <!-- 5. Metode Pembayaran -->
+      <!-- 6. Metode Pembayaran -->
       <div class="space-y-2">
         <span class="block text-sm font-semibold">Metode Pembayaran</span>
         <div class="grid grid-cols-2 p-1 rounded-2xl bg-surface-container-low">
@@ -353,16 +410,16 @@
       </div>
 
       <!-- Ringkasan Pesanan Sebelum Kirim -->
-      <div x-show="totalMainQty > 0" class="p-3.5 rounded-2xl bg-surface-container-low/80 space-y-1.5 text-xs">
+      <div x-show="hasAnyMainOrAlacarte" class="p-3.5 rounded-2xl bg-surface-container-low/80 space-y-1.5 text-xs">
         <div class="flex items-center justify-between font-semibold text-on-surface">
-          <span>Ringkasan (<span x-text="totalMainQty"></span> porsi)</span>
+          <span>Ringkasan Pesanan</span>
           <span x-show="estimatedTotal > 0" class="text-sm font-head font-bold text-primary" x-text="formatIDR(estimatedTotal)"></span>
         </div>
-        <p class="text-on-surface-variant" x-text="orderPreviewText()"></p>
+        <p class="text-on-surface-variant leading-relaxed" x-text="orderPreviewText()"></p>
       </div>
 
       <!-- Submit -->
-      <button type="submit" :disabled="submitting || !canOrder || totalMainQty === 0"
+      <button type="submit" :disabled="submitting || !config.is_open || !hasAnyMainOrAlacarte"
               class="btn-primary w-full py-4 rounded-full font-head font-semibold text-[16px] shadow-lg flex items-center justify-center gap-2 group">
         <span x-show="!submitting" x-text="estimatedTotal > 0 ? 'Pesan Sekarang (' + formatIDR(estimatedTotal) + ')' : 'Pesan Sekarang'"></span>
         <span x-show="submitting">Mengirim…</span>
@@ -398,7 +455,7 @@
 
       <p x-show="loginError" x-text="loginError" class="text-sm text-error font-medium -mt-2 mb-4"></p>
 
-      <!-- Keypad (anti double-tap zoom) -->
+      <!-- Keypad -->
       <div class="grid grid-cols-3 gap-2.5 w-full">
         <template x-for="k in ['1','2','3','4','5','6','7','8','9','C','0','⌫']" :key="k">
           <button type="button" @click="keypad(k)"
@@ -466,8 +523,8 @@
         <div class="glass rounded-3xl shadow-card p-5 space-y-4">
           <div class="flex items-center justify-between gap-3">
             <div>
-              <p class="font-semibold">Total Slot Porsi Hari Ini</p>
-              <p class="text-xs text-on-surface-variant">Kuota global porsi menu utama</p>
+              <p class="font-semibold">Total Slot Lauk / Paket Hari Ini</p>
+              <p class="text-xs text-on-surface-variant">Terhitung dari Menu Paket + Lauk Ala Carte</p>
             </div>
             <div class="flex items-center gap-1 bg-surface-container-low rounded-2xl p-1">
               <button type="button" @click="admin.global_quota = Math.max(0, (+admin.global_quota || 0) - 1)"
@@ -484,30 +541,35 @@
                    :class="quotaPct >= 90 ? 'bg-red-500' : 'bg-primary-container'" :style="`width:${quotaPct}%`"></div>
             </div>
             <div class="flex justify-between text-xs mt-2 font-semibold">
-              <span><span x-text="summary.total"></span> / <span x-text="summary.quota"></span> porsi terisi</span>
+              <span>
+                <span x-text="summary.total"></span> / <span x-text="summary.quota"></span> terisi
+                <span x-show="summary.lauk_alacarte > 0" class="text-[11px] font-normal text-on-surface-variant"
+                      x-text="'(' + (summary.package_total || 0) + ' paket + ' + summary.lauk_alacarte + ' lauk)'"></span>
+              </span>
               <span class="text-on-surface-variant">Sisa <span x-text="summary.remaining"></span> porsi</span>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- ===== Menu & Custom Config (Auto Title-Case) ===== -->
+      <!-- ===== Menu Paket, Ala Carte, Add-ons & Custom Config ===== -->
       <div class="space-y-4">
         <h3 class="font-head font-semibold text-[19px] flex items-center gap-2">
-          <span class="material-symbols-outlined text-primary">restaurant_menu</span> Pengaturan Menu &amp; Custom
+          <span class="material-symbols-outlined text-primary">restaurant_menu</span> Pengaturan Menu Harian
         </h3>
 
         <div class="glass rounded-3xl shadow-card p-5 space-y-6">
           <template x-for="group in [
-            {key:'main_menus', label:'Menu Utama', hint:'Huruf depan otomatis kapital • Akhiri harga mis. (15k)', icon:'lunch_dining', ph:'cth: Paket Ayam - Nasi + Ayam Rendang (15k)'},
-            {key:'side_menus', label:'Add-ons', hint:'Pisahkan varian ukuran & beri harga mis. (3k)', icon:'add_circle', ph:'cth: Martabak Tahu 2pcs (3k)'},
-            {key:'custom_options', label:'Opsi Kategori Custom', hint:'Beri (-4k) / (+2k) jika mengubah harga paket', icon:'tune', ph:'cth: Tanpa Nasi (-4k)'}
+            {key:'main_menus', label:'Menu Paket', hint:'Komplit • Akhiri harga mis. (15k)', icon:'inventory_2', ph:'cth: Paket Ayam - Nasi + Ayam Rendang (15k)'},
+            {key:'alacarte_menus', label:'Menu Ala Carte (Pecahan Paket)', hint:'Item Lauk otomatis memotong kuota harian • Nasi/Sayur/Krupuk tidak potong kuota', icon:'dinner_dining', ph:'cth: Lauk Ayam Rendang (8k) atau Sayur Tumis (3k)'},
+            {key:'side_menus', label:'Menu Add-ons (Gorengan / Pendamping)', hint:'Menu tambahan di luar paket • Beri harga mis. (3k) / (5k)', icon:'add_circle', ph:'cth: Gorengan 2pcs (3k) atau Orek Tempe (3k)'},
+            {key:'custom_options', label:'Opsi Custom Paket', hint:'Beri (-4k) / (+2k) jika mengubah harga paket', icon:'tune', ph:'cth: Tanpa Nasi (-4k)'}
           ]" :key="group.key">
             <div class="space-y-2">
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between gap-2">
                 <div>
                   <span class="text-sm font-semibold" x-text="group.label"></span>
-                  <p class="text-[11px] text-on-surface-variant" x-text="group.hint"></p>
+                  <p class="text-[11px] text-on-surface-variant leading-snug" x-text="group.hint"></p>
                 </div>
                 <span class="text-xs font-semibold text-primary whitespace-nowrap" x-text="admin[group.key].filter(i => i.value.trim()).length + ' aktif'"></span>
               </div>
@@ -549,8 +611,8 @@
       <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         <div class="glass rounded-2xl shadow-card p-4">
           <div class="w-9 h-9 rounded-xl bg-emerald-50 text-primary flex items-center justify-center mb-2"><span class="material-symbols-outlined">shopping_cart</span></div>
-          <p class="font-head font-bold text-[26px] leading-none"><span x-text="summary.total"></span> <span class="text-xs font-body font-medium text-on-surface-variant">porsi</span></p>
-          <p class="text-xs text-on-surface-variant font-semibold mt-1">Total (<span x-text="summary.order_count || 0"></span> pemesan)</p>
+          <p class="font-head font-bold text-[26px] leading-none"><span x-text="summary.total"></span> <span class="text-xs font-body font-medium text-on-surface-variant">slot</span></p>
+          <p class="text-xs text-on-surface-variant font-semibold mt-1">Kuota Terpakai (<span x-text="summary.order_count || 0"></span> pemesan)</p>
         </div>
         <div x-show="summary.total_revenue > 0" class="glass rounded-2xl shadow-card p-4">
           <div class="w-9 h-9 rounded-xl bg-emerald-50 text-primary flex items-center justify-center mb-2"><span class="material-symbols-outlined">payments</span></div>
@@ -559,8 +621,8 @@
         </div>
         <template x-for="m in summary.by_main_menu" :key="'m-' + m.name">
           <div class="glass rounded-2xl shadow-card p-4">
-            <div class="w-9 h-9 rounded-xl bg-surface-container-low text-primary flex items-center justify-center mb-2"><span class="material-symbols-outlined">restaurant</span></div>
-            <p class="font-head font-bold text-[26px] leading-none"><span x-text="m.count"></span> <span class="text-xs font-body font-medium text-on-surface-variant">porsi</span></p>
+            <div class="w-9 h-9 rounded-xl bg-surface-container-low text-primary flex items-center justify-center mb-2"><span class="material-symbols-outlined">inventory_2</span></div>
+            <p class="font-head font-bold text-[26px] leading-none"><span x-text="m.count"></span> <span class="text-xs font-body font-medium text-on-surface-variant">paket</span></p>
             <p class="text-xs text-on-surface-variant font-semibold mt-1 truncate" :title="m.name" x-text="shortName(m.name)"></p>
           </div>
         </template>
@@ -569,6 +631,9 @@
       <div class="flex flex-wrap gap-2 text-xs">
         <template x-for="p in summary.by_payment" :key="'p-' + p.name">
           <span class="px-3 py-1.5 rounded-full bg-surface-container-low font-semibold"><span x-text="p.name"></span>: <span x-text="p.count"></span></span>
+        </template>
+        <template x-for="a in (summary.by_alacarte_menu || []).filter(x => x.count)" :key="'a-' + a.name">
+          <span class="px-3 py-1.5 rounded-full bg-blue-50 text-secondary font-semibold">Ala Carte <span x-text="shortName(a.name)"></span>: <span x-text="a.count"></span></span>
         </template>
         <template x-for="s in summary.by_side_menu.filter(x => x.count)" :key="'s-' + s.name">
           <span class="px-3 py-1.5 rounded-full bg-emerald-50 text-emerald-800 font-semibold">+<span x-text="shortName(s.name)"></span>: <span x-text="s.count"></span></span>
@@ -612,11 +677,14 @@
                         x-text="o.payment_method === 'qris' ? 'QRIS' : 'Cash'"></span>
                 </div>
               </div>
-              <div class="flex items-center justify-between gap-2">
-                <p class="text-sm font-medium text-on-surface" x-text="formatItemList(o.main_menus) || o.main_menu"></p>
+              <div class="flex items-start justify-between gap-2">
+                <div class="space-y-0.5 min-w-0">
+                  <p x-show="o.main_menus && o.main_menus.length" class="text-sm font-medium text-on-surface" x-text="formatItemList(o.main_menus)"></p>
+                  <p x-show="o.alacarte_menus && o.alacarte_menus.length" class="text-xs font-semibold text-secondary" x-text="'Ala Carte: ' + formatItemList(o.alacarte_menus)"></p>
+                  <p x-show="o.side_menus && o.side_menus.length" class="text-xs text-primary font-semibold" x-text="'Add-on: ' + formatItemList(o.side_menus)"></p>
+                </div>
                 <span x-show="o.total_price > 0" class="text-xs font-head font-bold text-primary whitespace-nowrap" x-text="formatIDR(o.total_price)"></span>
               </div>
-              <p x-show="o.side_menus && o.side_menus.length" class="text-xs text-primary font-semibold" x-text="'+ ' + formatItemList(o.side_menus)"></p>
               <div x-show="hasCustom(o)" class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-900 text-xs font-medium">
                 <span class="material-symbols-outlined text-[14px]">tune</span>
                 <span x-text="formatCustomOrder(o)"></span>
@@ -633,7 +701,8 @@
                 <th class="py-2.5 px-3 font-semibold">#</th>
                 <th class="py-2.5 px-3 font-semibold">Waktu</th>
                 <th class="py-2.5 px-3 font-semibold">Nama &amp; Lantai</th>
-                <th class="py-2.5 px-3 font-semibold">Menu Utama</th>
+                <th class="py-2.5 px-3 font-semibold">Menu Paket</th>
+                <th class="py-2.5 px-3 font-semibold">Ala Carte</th>
                 <th class="py-2.5 px-3 font-semibold">Add-ons</th>
                 <th class="py-2.5 px-3 font-semibold">Custom</th>
                 <th class="py-2.5 px-3 font-semibold">Total</th>
@@ -646,7 +715,8 @@
                   <td class="py-3 px-3 font-bold text-primary" x-text="String(o.id).padStart(3,'0')"></td>
                   <td class="py-3 px-3 text-on-surface-variant whitespace-nowrap" x-text="timeOf(o.timestamp)"></td>
                   <td class="py-3 px-3 font-semibold" x-text="o.name"></td>
-                  <td class="py-3 px-3 font-medium" x-text="formatItemList(o.main_menus) || o.main_menu"></td>
+                  <td class="py-3 px-3 font-medium" x-text="formatItemList(o.main_menus) || '-'"></td>
+                  <td class="py-3 px-3 text-secondary font-medium" x-text="formatItemList(o.alacarte_menus) || '-'"></td>
                   <td class="py-3 px-3 text-on-surface-variant" x-text="formatItemList(o.side_menus) || '-'"></td>
                   <td class="py-3 px-3">
                     <span x-show="hasCustom(o)" class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-amber-50 text-amber-900 text-xs font-semibold" x-text="formatCustomOrder(o)"></span>
@@ -735,7 +805,7 @@
       <span class="material-symbols-outlined text-[28px]">warning</span>
     </div>
     <h4 class="font-head font-semibold text-lg">Reset data hari ini?</h4>
-    <p class="text-sm text-on-surface-variant mt-1">Semua <b x-text="summary.order_count || 0"></b> pesanan (<b x-text="summary.total"></b> porsi) akan dihapus permanen. Konfigurasi menu tetap tersimpan.</p>
+    <p class="text-sm text-on-surface-variant mt-1">Semua <b x-text="summary.order_count || 0"></b> pesanan (<b x-text="summary.total"></b> slot kuota) akan dihapus permanen. Konfigurasi menu tetap tersimpan.</p>
     <div class="grid grid-cols-2 gap-2 mt-5">
       <button type="button" @click="confirmReset = false" class="py-3 rounded-full bg-surface-container-low font-semibold">Batal</button>
       <button type="button" @click="resetOrders()" class="py-3 rounded-full bg-tertiary text-white font-semibold">Ya, Reset</button>
@@ -762,20 +832,30 @@
 <style>@keyframes shake { 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-8px)} 40%,80%{transform:translateX(8px)} }</style>
 
 <script>
-// Extra iOS Safari safeguard: block double-tap zoom & pinch gesture zoom
 document.addEventListener('dblclick', (e) => { e.preventDefault(); }, { passive: false });
 document.addEventListener('gesturestart', (e) => { e.preventDefault(); }, { passive: false });
 
 function app() {
   let rowId = 0;
   const toRows = (list) => (list || []).map(v => ({ id: ++rowId, value: v }));
-  const emptySummary = () => ({ total: 0, order_count: 0, total_revenue: 0, quota: 0, remaining: 0, custom_order_count: 0, by_main_menu: [], by_side_menu: [], by_custom_option: [], by_payment: [] });
-  const freshForm = () => ({ name: '', main_qtys: {}, side_qtys: {}, custom_qtys: {}, custom_note: '', payment_method: 'cash' });
+  const emptySummary = () => ({
+    total: 0, package_total: 0, lauk_alacarte: 0, order_count: 0, total_revenue: 0,
+    quota: 0, remaining: 0, custom_order_count: 0,
+    by_main_menu: [], by_alacarte_menu: [], by_side_menu: [], by_custom_option: [], by_payment: [],
+  });
+  const freshForm = () => ({
+    name: '', main_qtys: {}, alacarte_qtys: {}, side_qtys: {}, custom_qtys: {},
+    custom_note: '', payment_method: 'cash',
+  });
 
   return {
     view: 'order',
     loading: true,
-    config: { is_open: false, global_quota: 0, main_menus: [], side_menus: [], custom_options: [], qr_url: '', used: 0, remaining: 0 },
+    config: {
+      is_open: false, global_quota: 0,
+      main_menus: [], alacarte_menus: [], quota_alacartes: [], side_menus: [], custom_options: [],
+      qr_url: '', used: 0, remaining: 0,
+    },
     form: freshForm(),
     submitting: false,
     toast: { show: false, msg: '', type: 'success', timer: null },
@@ -788,16 +868,31 @@ function app() {
     loginError: '',
     shake: false,
     showAdvanced: false,
-    admin: { is_open: false, global_quota: 0, main_menus: [], side_menus: [], custom_options: [], qr_url: '', new_pin: '' },
+    admin: { is_open: false, global_quota: 0, main_menus: [], alacarte_menus: [], side_menus: [], custom_options: [], qr_url: '', new_pin: '' },
     orders: [],
     summary: emptySummary(),
     saving: false, togglingOpen: false, exporting: false, refreshing: false,
     confirmReset: false,
 
-    get canOrder() { return this.config.is_open && this.config.remaining > 0; },
     get quotaPct() { return this.summary.quota > 0 ? Math.min(100, Math.round(this.summary.total / this.summary.quota * 100)) : 100; },
     get totalMainQty() {
       return (this.config.main_menus || []).reduce((sum, m) => sum + (this.form.main_qtys[m] || 0), 0);
+    },
+    get totalAlacarteQty() {
+      return (this.config.alacarte_menus || []).reduce((sum, a) => sum + (this.form.alacarte_qtys[a] || 0), 0);
+    },
+    get totalQuotaAlacarteQty() {
+      return (this.config.alacarte_menus || []).reduce((sum, a) => sum + (this.isQuotaAlacarte(a) ? (this.form.alacarte_qtys[a] || 0) : 0), 0);
+    },
+    // Total slots consumed by current cart (Menu Paket + Lauk Ala Carte)
+    get totalQuotaSelected() {
+      return this.totalMainQty + this.totalQuotaAlacarteQty;
+    },
+    get hasAnyMainOrAlacarte() {
+      return this.totalMainQty > 0 || this.totalAlacarteQty > 0;
+    },
+    get totalSelectedCount() {
+      return this.totalMainQty + this.totalAlacarteQty;
     },
     get estimatedTotal() {
       let total = 0;
@@ -805,18 +900,27 @@ function app() {
         const q = this.form.main_qtys[m] || 0;
         if (q > 0) total += q * this.menuParts(m).priceNum;
       });
+      (this.config.alacarte_menus || []).forEach(a => {
+        const q = this.form.alacarte_qtys[a] || 0;
+        if (q > 0) total += q * this.menuParts(a).priceNum;
+      });
       (this.config.side_menus || []).forEach(s => {
         const q = this.form.side_qtys[s] || 0;
         if (q > 0) total += q * this.menuParts(s).priceNum;
       });
-      (this.config.custom_options || []).forEach(co => {
-        const q = this.getCustomQty(co);
-        if (q > 0) total += q * this.menuParts(co).priceNum;
-      });
+      if (this.totalMainQty > 0) {
+        (this.config.custom_options || []).forEach(co => {
+          const q = this.getCustomQty(co);
+          if (q > 0) total += q * this.menuParts(co).priceNum;
+        });
+      }
       return Math.max(0, total);
     },
 
-    // Parse "Paket Ayam - Isi (15k)" or "Tanpa Nasi (-4k)" or "Extra Sambal (+2k)"
+    isQuotaAlacarte(a) {
+      return (this.config.quota_alacartes || []).includes(a);
+    },
+
     menuParts(raw) {
       const str = String(raw || '').trim();
       let priceNum = 0, priceLabel = '', signedLabel = '';
@@ -850,21 +954,19 @@ function app() {
       return { title, desc, priceLabel, signedLabel, priceNum };
     },
 
-    // Friendly price explanation on custom option card (e.g. "Paket jadi Rp 11.000 (-Rp 4.000)" or "Harga tetap")
     customPriceHint(co) {
       const p = this.menuParts(co);
       if (p.priceNum < 0) {
         const sampleBase = (this.config.main_menus || []).map(m => this.menuParts(m).priceNum).find(v => v > 0) || 0;
         if (sampleBase > 0 && sampleBase + p.priceNum > 0) {
-          return `Jadi ${this.formatIDR(sampleBase + p.priceNum)} / porsi (${p.signedLabel})`;
+          return `Jadi ${this.formatIDR(sampleBase + p.priceNum)} / paket (${p.signedLabel})`;
         }
-        return `${p.signedLabel} / porsi`;
+        return `${p.signedLabel} / paket`;
       }
-      if (p.priceNum > 0) return `${p.signedLabel} / porsi`;
+      if (p.priceNum > 0) return `${p.signedLabel} / paket`;
       return 'Harga tetap';
     },
 
-    // Auto-capitalize first letter of words while keeping units like (15k), (-4k), 2pcs clean
     toTitleCaseMenu(s) {
       s = String(s || '').replace(/\s+/g, ' ').trim();
       if (!s) return '';
@@ -900,7 +1002,7 @@ function app() {
 
     getMainQty(m) { return this.form.main_qtys[m] || 0; },
     incMain(m) {
-      if (this.totalMainQty >= this.config.remaining) return;
+      if (this.totalQuotaSelected >= this.config.remaining) return;
       this.form.main_qtys[m] = (this.form.main_qtys[m] || 0) + 1;
     },
     decMain(m) {
@@ -909,6 +1011,16 @@ function app() {
         this.form.main_qtys[m] = cur - 1;
         this.clampCustomQtys();
       }
+    },
+
+    getAlacarteQty(a) { return this.form.alacarte_qtys[a] || 0; },
+    incAlacarte(a) {
+      if (this.isQuotaAlacarte(a) && this.totalQuotaSelected >= this.config.remaining) return;
+      this.form.alacarte_qtys[a] = (this.form.alacarte_qtys[a] || 0) + 1;
+    },
+    decAlacarte(a) {
+      const cur = this.form.alacarte_qtys[a] || 0;
+      if (cur > 0) this.form.alacarte_qtys[a] = cur - 1;
     },
 
     getSideQty(s) { return this.form.side_qtys[s] || 0; },
@@ -920,9 +1032,7 @@ function app() {
 
     getCustomQty(co) { return this.form.custom_qtys[co] || 0; },
     tapCustom(co) {
-      if (this.totalMainQty <= 0) {
-        return this.notify('Pilih menu utama terlebih dahulu', 'error');
-      }
+      if (this.totalMainQty <= 0) return;
       if (this.totalMainQty === 1) {
         this.form.custom_qtys[co] = this.getCustomQty(co) > 0 ? 0 : 1;
       } else {
@@ -930,7 +1040,7 @@ function app() {
       }
     },
     incCustom(co) {
-      if (this.totalMainQty <= 0) return this.notify('Pilih menu utama terlebih dahulu', 'error');
+      if (this.totalMainQty <= 0) return;
       const cur = this.getCustomQty(co);
       if (cur < this.totalMainQty) this.form.custom_qtys[co] = cur + 1;
     },
@@ -945,15 +1055,21 @@ function app() {
         const q = this.getMainQty(m);
         if (q > 0) parts.push(`${q}x ${this.shortName(m)}`);
       });
+      (this.config.alacarte_menus || []).forEach(a => {
+        const q = this.getAlacarteQty(a);
+        if (q > 0) parts.push(`${q}x ${this.shortName(a)}`);
+      });
       (this.config.side_menus || []).forEach(s => {
         const q = this.getSideQty(s);
         if (q > 0) parts.push(`+${q}x ${this.shortName(s)}`);
       });
       const customs = [];
-      (this.config.custom_options || []).forEach(co => {
-        const q = this.getCustomQty(co);
-        if (q > 0) customs.push(q > 1 ? `${q}x ${this.shortName(co)}` : this.shortName(co));
-      });
+      if (this.totalMainQty > 0) {
+        (this.config.custom_options || []).forEach(co => {
+          const q = this.getCustomQty(co);
+          if (q > 0) customs.push(q > 1 ? `${q}x ${this.shortName(co)}` : this.shortName(co));
+        });
+      }
       if (this.form.custom_note.trim()) customs.push(this.form.custom_note.trim());
       if (customs.length) parts.push(`[Custom: ${customs.join(', ')}]`);
       return parts.join(' • ');
@@ -1020,9 +1136,12 @@ function app() {
     async loadConfig() {
       try {
         const c = await this.api('/api/config');
+        c.alacarte_menus = c.alacarte_menus || [];
+        c.quota_alacartes = c.quota_alacartes || [];
         c.custom_options = c.custom_options || [];
         this.config = c;
         Object.keys(this.form.main_qtys).forEach(k => { if (!c.main_menus.includes(k)) delete this.form.main_qtys[k]; });
+        Object.keys(this.form.alacarte_qtys).forEach(k => { if (!c.alacarte_menus.includes(k)) delete this.form.alacarte_qtys[k]; });
         Object.keys(this.form.side_qtys).forEach(k => { if (!c.side_menus.includes(k)) delete this.form.side_qtys[k]; });
         Object.keys(this.form.custom_qtys).forEach(k => { if (!c.custom_options.includes(k)) delete this.form.custom_qtys[k]; });
         this.clampCustomQtys();
@@ -1034,19 +1153,28 @@ function app() {
       const main_menus = (this.config.main_menus || [])
         .map(name => ({ name, qty: this.getMainQty(name) }))
         .filter(x => x.qty > 0);
-      if (!main_menus.length) return this.notify('Pilih minimal 1 porsi menu utama', 'error');
+      const alacarte_menus = (this.config.alacarte_menus || [])
+        .map(name => ({ name, qty: this.getAlacarteQty(name) }))
+        .filter(x => x.qty > 0);
+
+      if (!main_menus.length && !alacarte_menus.length) {
+        return this.notify('Pilih minimal 1 Menu Paket atau Menu Ala Carte', 'error');
+      }
 
       const side_menus = (this.config.side_menus || [])
         .map(name => ({ name, qty: this.getSideQty(name) }))
         .filter(x => x.qty > 0);
 
-      const custom_items = (this.config.custom_options || [])
-        .map(name => ({ name, qty: this.getCustomQty(name) }))
-        .filter(x => x.qty > 0);
+      const custom_items = main_menus.length
+        ? (this.config.custom_options || [])
+            .map(name => ({ name, qty: this.getCustomQty(name) }))
+            .filter(x => x.qty > 0)
+        : [];
 
       const payload = {
         name: this.form.name.trim(),
         main_menus,
+        alacarte_menus,
         side_menus,
         custom_items,
         custom_note: this.form.custom_note.trim(),
@@ -1116,6 +1244,7 @@ function app() {
           Object.assign(this.admin, {
             global_quota: this.config.global_quota,
             main_menus: toRows(this.config.main_menus),
+            alacarte_menus: toRows(this.config.alacarte_menus),
             side_menus: toRows(this.config.side_menus),
             custom_options: toRows(this.config.custom_options),
             qr_url: this.config.qr_url, new_pin: '',
@@ -1142,11 +1271,12 @@ function app() {
       const payload = {
         global_quota: Math.max(0, parseInt(this.admin.global_quota, 10) || 0),
         main_menus: this.admin.main_menus.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
+        alacarte_menus: this.admin.alacarte_menus.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
         side_menus: this.admin.side_menus.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
         custom_options: this.admin.custom_options.map(i => this.toTitleCaseMenu(i.value)).filter(Boolean),
         qr_url: this.admin.qr_url || '',
       };
-      if (!payload.main_menus.length) return this.notify('Minimal 1 menu utama', 'error');
+      if (!payload.main_menus.length) return this.notify('Minimal 1 menu paket', 'error');
       if (this.admin.new_pin) {
         if (!/^\d{6}$/.test(this.admin.new_pin)) return this.notify('PIN baru harus 6 digit angka', 'error');
         payload.admin_pin = this.admin.new_pin;
@@ -1197,12 +1327,16 @@ function app() {
         '*REKAP PESANAN MBG ORDERING SYSTEM*',
         '📅 ' + this.todayLabel(),
         '',
-        `Total Porsi: *${s.total}* / ${s.quota} slot (${s.order_count || 0} pemesan)`,
+        `Kuota Terpakai: *${s.total}* / ${s.quota} slot (${s.package_total || 0} paket + ${s.lauk_alacarte || 0} lauk ala carte • ${s.order_count || 0} pemesan)`,
       ];
       if (s.total_revenue > 0) lines.push(`Estimasi Total: *${this.formatIDR(s.total_revenue)}*`);
-      if (s.custom_order_count > 0) lines.push(`Pesanan Custom: *${s.custom_order_count}*`);
-      lines.push('', '*Menu Utama*');
-      s.by_main_menu.forEach(m => lines.push(`• ${this.shortName(m.name)}: ${m.count} porsi`));
+      lines.push('', '*Menu Paket*');
+      s.by_main_menu.forEach(m => lines.push(`• ${this.shortName(m.name)}: ${m.count} paket`));
+      const alas = (s.by_alacarte_menu || []).filter(x => x.count);
+      if (alas.length) {
+        lines.push('', '*Menu Ala Carte*');
+        alas.forEach(a => lines.push(`• ${this.shortName(a.name)}: ${a.count}`));
+      }
       const sides = s.by_side_menu.filter(x => x.count);
       if (sides.length) {
         lines.push('', '*Add-ons*');
@@ -1210,19 +1344,21 @@ function app() {
       }
       const customs = (s.by_custom_option || []).filter(x => x.count);
       if (customs.length) {
-        lines.push('', '*Kategori Custom*');
-        customs.forEach(c => lines.push(`• ${this.shortName(c.name)}: ${c.count} porsi`));
+        lines.push('', '*Custom Paket*');
+        customs.forEach(c => lines.push(`• ${this.shortName(c.name)}: ${c.count} paket`));
       }
       lines.push('', '*Pembayaran*');
       s.by_payment.forEach(p => lines.push(`• ${p.name}: ${p.count}`));
       if (this.orders.length) {
         lines.push('', '*Daftar Pesanan*');
         [...this.orders].reverse().forEach((o, i) => {
-          const mains = this.formatItemList(o.main_menus) || o.main_menu;
-          const add = (o.side_menus && o.side_menus.length) ? ` (+${this.formatItemList(o.side_menus)})` : '';
+          const itemParts = [];
+          if (o.main_menus && o.main_menus.length) itemParts.push(this.formatItemList(o.main_menus));
+          if (o.alacarte_menus && o.alacarte_menus.length) itemParts.push(`Ala Carte: ${this.formatItemList(o.alacarte_menus)}`);
+          if (o.side_menus && o.side_menus.length) itemParts.push(`+${this.formatItemList(o.side_menus)}`);
           const cust = this.hasCustom(o) ? ` [Custom: ${this.formatCustomOrder(o)}]` : '';
           const tot = o.total_price > 0 ? ` - ${this.formatIDR(o.total_price)}` : '';
-          lines.push(`${i + 1}. ${o.name} — ${mains}${add}${cust}${tot} [${o.payment_method === 'qris' ? 'QRIS' : 'Cash'}]`);
+          lines.push(`${i + 1}. ${o.name} — ${itemParts.join(', ')}${cust}${tot} [${o.payment_method === 'qris' ? 'QRIS' : 'Cash'}]`);
         });
       }
       return lines.join('\n');
