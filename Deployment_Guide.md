@@ -171,14 +171,22 @@ sudo ufw status
 
 ## 9. Operasional Rutin: Update, Backup, & Troubleshooting
 
-### A. Update Aplikasi (Deploy Perubahan Baru dari GitHub)
-Setiap kali ada update kode di branch `main`:
+### A. Update Aplikasi Sekali Klik (`deploy.sh`)
+Di repository sudah disediakan script otomatis **`deploy.sh`** yang mengurus semuanya sekaligus: pindah ke folder project (`cd`), *auto-backup* database SQLite sebelum update, menjaga perubahan lokal di `docker-compose.yml` (seperti `ADMIN_PIN`/port), `git pull`, `docker compose up -d --build`, bersih-bersih image lama, hingga tes `/healthz`.
+
+**Setup sekali saja di server (agar bisa dipanggil dari mana pun):**
 ```bash
 cd /var/www/panji-mbg
 git pull origin main
-docker compose up -d --build
-docker image prune -f
+chmod +x deploy.sh
+sudo ln -sf /var/www/panji-mbg/deploy.sh /usr/local/bin/deploy-mbg
 ```
+
+**Selanjutnya setiap habis push kode baru ke GitHub, cukup ketik 1 perintah ini di server:**
+```bash
+deploy-mbg
+```
+*(Atau panggil langsung `/var/www/panji-mbg/deploy.sh`).*
 
 ### B. Backup Database SQLite dengan Aman
 Karena SQLite berjalan dengan mode **WAL (Write-Ahead Logging)**, gunakan perintah `.backup` bawaan `sqlite3` agar backup selalu utuh walau ada pelanggan yang sedang memesan:

@@ -64,6 +64,7 @@ mbg-panji/
 ├── index.html           # Single-Page App (Pelanggan & Admin Dashboard)
 ├── logo.jpg             # Logo resmi MBG APS (Header & Favicon)
 ├── qris.jpg             # Gambar QRIS default (MBG APS, Layanan Katering)
+├── deploy.sh            # Script 1-klik auto-deploy di server Ubuntu (git pull + backup + rebuild)
 ├── run-dev.ps1          # Script helper menjalankan server lokal di Windows (tanpa Docker)
 ├── Dockerfile           # Multi-stage build (golang:1.21-alpine -> alpine:latest)
 ├── docker-compose.yml   # Konfigurasi container & volume persistence ./data
@@ -236,12 +237,15 @@ sudo certbot --nginx -d panji.domainkamu.com
 
 ## 🔄 Update & Backup di Server
 
-### Update ke Versi Terbaru dari GitHub
+### Update ke Versi Terbaru dari GitHub (1 Perintah via `deploy.sh`)
+Pasang *shortcut* sekali saja di server:
 ```bash
-cd /opt/mbg-panji
-git pull origin main
-docker compose up -d --build
-docker image prune -f
+chmod +x /var/www/panji-mbg/deploy.sh
+sudo ln -sf /var/www/panji-mbg/deploy.sh /usr/local/bin/deploy-mbg
+```
+Selanjutnya setiap habis `git push`, cukup jalankan dari direktori mana saja:
+```bash
+deploy-mbg
 ```
 
 ### Backup Database SQLite

@@ -5,6 +5,7 @@ data/
 *.db-shm
 *.db-journal
 backup-*.db
+backups/
 
 # Compiled binaries
 *.exe
