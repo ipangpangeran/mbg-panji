@@ -1371,18 +1371,13 @@ func handleCreateOrder(c *gin.Context) {
 		return
 	}
 	remaining := cfg.GlobalQuota - used
-	if remaining < 0 {
-		remaining = 0
+	if remaining <= 0 {
+		fail(c, http.StatusConflict, "MBG Sold Out. Silahkan chat admin untuk order manual jika masih ada.")
+		return
 	}
-	if quotaNeeded > 0 {
-		if remaining <= 0 {
-			fail(c, http.StatusConflict, "Maaf, kuota lauk/paket hari ini sudah habis")
-			return
-		}
-		if quotaNeeded > remaining {
-			fail(c, http.StatusConflict, fmt.Sprintf("Maaf, sisa kuota lauk/paket hanya %d porsi (kamu memilih %d porsi)", remaining, quotaNeeded))
-			return
-		}
+	if quotaNeeded > remaining {
+		fail(c, http.StatusConflict, fmt.Sprintf("Maaf, sisa kuota tinggal %d porsi (kamu memilih %d porsi)", remaining, quotaNeeded))
+		return
 	}
 
 	totalPrice := calcOrderTotal(mains, alacartes, sides, customs)

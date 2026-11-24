@@ -151,24 +151,25 @@
     </div>
 
     <!-- Closed notice -->
-    <div x-show="!config.is_open" class="flex items-start gap-3 p-4 rounded-2xl bg-red-50 text-red-800">
+    <div x-show="!config.is_open" class="flex items-start gap-3 p-4 rounded-2xl bg-red-50 text-red-800 border border-red-200">
       <span class="material-symbols-outlined">storefront</span>
       <div>
         <p class="font-semibold">Pemesanan sedang tutup</p>
-        <p class="text-sm opacity-80">Silakan kembali lagi nanti.</p>
+        <p class="text-sm opacity-85">Silahkan kembali lagi nanti.</p>
       </div>
     </div>
 
-    <!-- Lauk quota full notice (non-lauk ala carte still available if store is open) -->
-    <div x-show="config.is_open && config.remaining <= 0" class="flex items-start gap-3 p-3.5 rounded-2xl bg-amber-50 text-amber-900 border border-amber-200">
-      <span class="material-symbols-outlined text-[20px]">info</span>
-      <div class="text-xs leading-relaxed">
-        <p class="font-semibold text-sm">Kuota Lauk &amp; Menu Paket hari ini sudah habis</p>
-        <p class="opacity-85">Item Ala Carte non-lauk (seperti Nasi / Sayur / Krupuk) tetap bisa dipesan selama tersedia.</p>
+    <!-- Sold Out notice -->
+    <div x-show="config.is_open && config.remaining <= 0" class="flex items-start gap-3 p-4 rounded-2xl bg-red-50 text-red-800 border border-red-200">
+      <span class="material-symbols-outlined">production_quantity_limits</span>
+      <div>
+        <p class="font-head font-bold text-base">MBG Sold Out.</p>
+        <p class="text-sm opacity-90 mt-0.5">Silahkan chat admin untuk order manual jika masih ada.</p>
       </div>
     </div>
 
-    <form @submit.prevent="submitOrder()" class="glass rounded-3xl shadow-card p-5 space-y-6" :class="!config.is_open && 'opacity-60 pointer-events-none'">
+    <form @submit.prevent="submitOrder()" class="glass rounded-3xl shadow-card p-5 space-y-6"
+          :class="(!config.is_open || config.remaining <= 0) && 'opacity-55 pointer-events-none select-none'">
       <!-- 1. Nama Pemesan -->
       <div class="space-y-2">
         <label for="name" class="block text-sm font-semibold">Nama Pemesan</label>
@@ -431,7 +432,7 @@
       </div>
 
       <!-- Submit -->
-      <button type="submit" :disabled="submitting || !config.is_open || !hasAnyMainOrAlacarte || totalQuotaSelected > config.remaining"
+      <button type="submit" :disabled="submitting || !config.is_open || config.remaining <= 0 || !hasAnyMainOrAlacarte || totalQuotaSelected > config.remaining"
               class="btn-primary w-full py-4 rounded-full font-head font-semibold text-[16px] shadow-lg flex items-center justify-center gap-2 group">
         <span x-show="!submitting" x-text="estimatedTotal > 0 ? 'Pesan Sekarang (' + formatIDR(estimatedTotal) + ')' : 'Pesan Sekarang'"></span>
         <span x-show="submitting">Mengirim…</span>
@@ -706,11 +707,17 @@
         </template>
       </div>
 
-      <div class="grid grid-cols-2 gap-3">
-        <button type="button" @click="copyRekap()" class="py-3.5 rounded-2xl bg-primary text-white font-semibold shadow-lg hover:opacity-95 active:scale-[.98] transition flex items-center justify-center gap-2">
-          <span class="material-symbols-outlined text-[20px]">content_copy</span> Salin Rekap WA
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+        <button type="button" @click="copyRekapDapur()"
+                class="py-3.5 px-4 rounded-2xl bg-primary text-white font-semibold shadow-lg hover:opacity-95 active:scale-[.98] transition flex items-center justify-center gap-2 text-sm">
+          <span class="material-symbols-outlined text-[20px]">soup_kitchen</span> Salin Rekap Dapur
         </button>
-        <button type="button" @click="exportExcel()" :disabled="exporting" class="py-3.5 rounded-2xl bg-white border border-slate-200 font-semibold shadow-card hover:bg-surface-container-low active:scale-[.98] transition flex items-center justify-center gap-2">
+        <button type="button" @click="copyRekapWAG()"
+                class="py-3.5 px-4 rounded-2xl bg-secondary text-white font-semibold shadow-lg hover:opacity-95 active:scale-[.98] transition flex items-center justify-center gap-2 text-sm">
+          <span class="material-symbols-outlined text-[20px]">format_list_numbered</span> Salin List WAG
+        </button>
+        <button type="button" @click="exportExcel()" :disabled="exporting"
+                class="py-3.5 px-4 rounded-2xl bg-white border border-slate-200 font-semibold shadow-card hover:bg-surface-container-low active:scale-[.98] transition flex items-center justify-center gap-2 text-sm">
           <span class="material-symbols-outlined text-[20px]">download</span> <span x-text="exporting ? 'Menyiapkan…' : 'Export Excel'"></span>
         </button>
       </div>
@@ -1511,50 +1518,130 @@ function app() {
       } catch (e) { this.notify(e.message, 'error'); }
       finally { this.exporting = false; }
     },
-    rekapText() {
-      const s = this.summary;
-      const lines = [
-        '*REKAP PESANAN MBG ORDERING SYSTEM*',
-        '📅 Untuk: ' + this.orderDateLabel(),
-        '',
-        `Kuota Terpakai: *${s.total}* / ${s.quota} slot (${s.package_total || 0} paket + ${s.lauk_alacarte || 0} lauk ala carte • ${s.order_count || 0} pemesan)`,
-      ];
-      if (s.total_revenue > 0) lines.push(`Estimasi Total: *${this.formatIDR(s.total_revenue)}*`);
-      lines.push('', '*Menu Paket*');
-      s.by_main_menu.forEach(m => lines.push(`• ${this.shortName(m.name)}: ${m.count} paket`));
-      const alas = (s.by_alacarte_menu || []).filter(x => x.count);
-      if (alas.length) {
-        lines.push('', '*Menu Ala Carte*');
-        alas.forEach(a => lines.push(`• ${this.shortName(a.name)}: ${a.count}`));
-      }
-      const sides = s.by_side_menu.filter(x => x.count);
-      if (sides.length) {
-        lines.push('', '*Add-ons*');
-        sides.forEach(m => lines.push(`• ${this.shortName(m.name)}: ${m.count}`));
-      }
-      const customs = (s.by_custom_option || []).filter(x => x.count);
-      if (customs.length) {
-        lines.push('', '*Custom Paket*');
-        customs.forEach(c => lines.push(`• ${this.shortName(c.name)}: ${c.count} paket`));
-      }
-      lines.push('', '*Pembayaran*');
-      s.by_payment.forEach(p => lines.push(`• ${p.name}: ${p.count}`));
-      if (this.orders.length) {
-        lines.push('', '*Daftar Pesanan*');
-        [...this.orders].reverse().forEach((o, i) => {
-          const itemParts = [];
-          if (o.main_menus && o.main_menus.length) itemParts.push(this.formatItemList(o.main_menus));
-          if (o.alacarte_menus && o.alacarte_menus.length) itemParts.push(`Ala Carte: ${this.formatItemList(o.alacarte_menus)}`);
-          if (o.side_menus && o.side_menus.length) itemParts.push(`+${this.formatItemList(o.side_menus)}`);
-          const cust = this.hasCustom(o) ? ` [Custom: ${this.formatCustomOrder(o)}]` : '';
-          const tot = o.total_price > 0 ? ` - ${this.formatIDR(o.total_price)}` : '';
-          lines.push(`${i + 1}. ${o.name} — ${itemParts.join(', ')}${cust}${tot} [${o.payment_method === 'qris' ? 'QRIS' : 'Cash'}]`);
+    // Extract core dish name for Kitchen Report (e.g. "Paket Ayam Rica Kemangi" -> "Ayam Rica Kemangi")
+    kitchenDishName(raw) {
+      let s = this.shortName(raw).replace(/^paket\s+/i, '').replace(/^lauk\s+/i, '').trim();
+      return s || this.shortName(raw);
+    },
+
+    // Report 1: Rekap Dapur (fokus total porsi/pcs masakan termasuk gabungan Paket + Ala Carte + konversi Pcs Add-ons)
+    rekapDapurText() {
+      const dishMap = new Map(); // keyLower -> { label, count, unit }
+      const addDish = (label, qty, unit = 'Porsi') => {
+        if (!label || qty <= 0) return;
+        const key = label.toLowerCase() + '|' + unit.toLowerCase();
+        if (!dishMap.has(key)) dishMap.set(key, { label, count: 0, unit });
+        dishMap.get(key).count += qty;
+      };
+
+      // Seed main dishes from configured Menu Paket so even 0-order or ordered items keep neat order
+      (this.config.main_menus || []).forEach(m => {
+        const name = this.kitchenDishName(m);
+        const key = name.toLowerCase() + '|porsi';
+        if (!dishMap.has(key)) dishMap.set(key, { label: name, count: 0, unit: 'Porsi' });
+      });
+
+      // Aggregate from all actual orders so Paket + Ala Carte Lauk merge accurately
+      (this.orders || []).forEach(o => {
+        (o.main_menus || []).forEach(m => {
+          addDish(this.kitchenDishName(m.name), m.qty, 'Porsi');
         });
+        (o.alacarte_menus || []).forEach(a => {
+          if (this.isQuotaAlacarte(a.name)) {
+            addDish(this.kitchenDishName(a.name), a.qty, 'Porsi');
+          } else {
+            addDish(this.shortName(a.name) + ' (Ala Carte)', a.qty, 'Porsi');
+          }
+        });
+      });
+
+      // Aggregate Add-ons: convert "<Item> <N>pcs" into total Pcs (e.g. 2pcs + 4pcs -> total Pcs!)
+      const sideMap = new Map();
+      const pcsRe = /^(.+?)\s+(\d+)\s*pcs$/i;
+      (this.orders || []).forEach(o => {
+        (o.side_menus || []).forEach(s => {
+          const clean = this.shortName(s.name);
+          const pm = clean.match(pcsRe);
+          if (pm) {
+            const baseLabel = pm[1].replace(/^gorengan\s+/i, '').trim() || pm[1].trim();
+            const pcsPerUnit = parseInt(pm[2], 10) || 1;
+            const key = baseLabel.toLowerCase() + '|pcs';
+            if (!sideMap.has(key)) sideMap.set(key, { label: baseLabel, count: 0, unit: 'Pcs' });
+            sideMap.get(key).count += s.qty * pcsPerUnit;
+          } else {
+            const key = clean.toLowerCase() + '|porsi';
+            if (!sideMap.has(key)) sideMap.set(key, { label: clean, count: 0, unit: 'Porsi' });
+            sideMap.get(key).count += s.qty;
+          }
+        });
+      });
+
+      const allRows = [
+        ...Array.from(dishMap.values()).filter(r => r.count > 0),
+        ...Array.from(sideMap.values()).filter(r => r.count > 0),
+      ];
+
+      const lines = [
+        '*REKAP DAPUR MBG*',
+        '📅 ' + this.orderDateLabel(),
+        '',
+      ];
+
+      if (!allRows.length) {
+        lines.push('_Belum ada pesanan masuk._');
+        return lines.join('\n');
+      }
+
+      const maxLen = Math.max(...allRows.map(r => r.label.length), 8);
+      lines.push('```');
+      allRows.forEach(r => {
+        lines.push(`${r.label.padEnd(maxLen, ' ')} : ${r.count} ${r.unit}`);
+      });
+      lines.push('```');
+
+      // Sertakan ringkasan custom paket & catatan khusus bila ada agar takaran nasi/sayur dapur akurat
+      const customs = (this.summary.by_custom_option || []).filter(x => x.count > 0);
+      if (customs.length) {
+        lines.push('', '*Info Custom Paket:*');
+        customs.forEach(c => lines.push(`• ${this.shortName(c.name)} : ${c.count} Paket`));
       }
       return lines.join('\n');
     },
-    async copyRekap() {
-      const text = this.rekapText();
+
+    // Report 2: List Validasi Pembeli di WAG (nomor urut 1, 2, 3... persis gaya list WA grup)
+    rekapWAGText() {
+      const s = this.summary;
+      const lines = [
+        `*LIST PESANAN MBG — ${this.orderDateLabel()}*`,
+        `Slot Terisi: *${s.total} / ${s.quota}*`,
+        '',
+      ];
+      if (!this.orders.length) {
+        lines.push('1. _Belum ada pesanan_');
+        return lines.join('\n');
+      }
+      const fmtWAGItems = (items) => (items || []).map(it => it.qty > 1 ? `${this.shortName(it.name)} (${it.qty})` : this.shortName(it.name));
+
+      [...this.orders].reverse().forEach((o, i) => {
+        const parts = [
+          ...fmtWAGItems(o.main_menus),
+          ...fmtWAGItems(o.alacarte_menus),
+          ...fmtWAGItems(o.side_menus),
+        ];
+        const custs = [];
+        if (Array.isArray(o.custom_items) && o.custom_items.length) {
+          o.custom_items.forEach(ci => custs.push(ci.qty > 1 ? `${this.shortName(ci.name)} ${ci.qty}` : this.shortName(ci.name)));
+        } else if (Array.isArray(o.custom_options) && o.custom_options.length) {
+          custs.push(...o.custom_options);
+        }
+        if (o.custom_note && o.custom_note.trim()) custs.push(o.custom_note.trim());
+        const custText = custs.length ? ` _(${custs.join(', ')})_` : '';
+        lines.push(`${i + 1}. ${o.name} : ${parts.join(' + ')}${custText}`);
+      });
+      return lines.join('\n');
+    },
+
+    async copyTextToClipboard(text, successMsg) {
       try {
         if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
         else {
@@ -1562,9 +1649,11 @@ function app() {
           ta.style.position = 'fixed'; ta.style.opacity = '0';
           document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
         }
-        this.notify('Rekap disalin, tinggal paste di WhatsApp');
+        this.notify(successMsg);
       } catch { this.notify('Gagal menyalin rekap', 'error'); }
     },
+    copyRekapDapur() { return this.copyTextToClipboard(this.rekapDapurText(), 'Rekap Dapur disalin ke clipboard!'); },
+    copyRekapWAG() { return this.copyTextToClipboard(this.rekapWAGText(), 'List Pesanan WAG disalin ke clipboard!'); },
 
     orderDateLabel() {
       if (this.config && this.config.order_date_label) return this.config.order_date_label;
