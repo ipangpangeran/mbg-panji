@@ -879,6 +879,9 @@ function app() {
     get totalAlacarteQty() {
       return (this.config.alacarte_menus || []).reduce((sum, a) => sum + (this.form.alacarte_qtys[a] || 0), 0);
     },
+    get totalSideQty() {
+      return (this.config.side_menus || []).reduce((sum, s) => sum + (this.form.side_qtys[s] || 0), 0);
+    },
     get totalQuotaAlacarteQty() {
       return (this.config.alacarte_menus || []).reduce((sum, a) => sum + (this.isQuotaAlacarte(a) ? (this.form.alacarte_qtys[a] || 0) : 0), 0);
     },
@@ -887,10 +890,10 @@ function app() {
       return this.totalMainQty + this.totalQuotaAlacarteQty;
     },
     get hasAnyMainOrAlacarte() {
-      return this.totalMainQty > 0 || this.totalAlacarteQty > 0;
+      return this.totalMainQty > 0 || this.totalAlacarteQty > 0 || this.totalSideQty > 0;
     },
     get totalSelectedCount() {
-      return this.totalMainQty + this.totalAlacarteQty;
+      return this.totalMainQty + this.totalAlacarteQty + this.totalSideQty;
     },
     get estimatedTotal() {
       let total = 0;
@@ -1254,14 +1257,13 @@ function app() {
       const alacarte_menus = (this.config.alacarte_menus || [])
         .map(name => ({ name, qty: this.getAlacarteQty(name) }))
         .filter(x => x.qty > 0);
-
-      if (!main_menus.length && !alacarte_menus.length) {
-        return this.notify('Pilih minimal 1 Menu Paket atau Menu Ala Carte', 'error');
-      }
-
       const side_menus = (this.config.side_menus || [])
         .map(name => ({ name, qty: this.getSideQty(name) }))
         .filter(x => x.qty > 0);
+
+      if (!main_menus.length && !alacarte_menus.length && !side_menus.length) {
+        return this.notify('Pilih minimal 1 menu atau add-on terlebih dahulu', 'error');
+      }
 
       const custom_items = main_menus.length
         ? (this.config.custom_options || [])

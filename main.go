@@ -1293,16 +1293,11 @@ func handleCreateOrder(c *gin.Context) {
 		alacartes = append(alacartes, OrderItem{Name: aName, Qty: alaMap[aName]})
 	}
 
-	// Customer must select at least 1 Menu Paket OR 1 Menu Ala Carte
-	if packagePortions <= 0 && alaTotalQty <= 0 {
-		fail(c, http.StatusBadRequest, "Pilih minimal 1 Menu Paket atau Menu Ala Carte")
-		return
-	}
-
 	// 3. Normalize side_menus (Add-ons)
 	sidesParsed := parseOrderItems(string(req.SideMenusRaw))
 	sidesMap := map[string]int{}
 	sidesOrder := []string{}
+	sideTotalQty := 0
 	for _, it := range sidesParsed {
 		if it.Qty <= 0 {
 			continue
@@ -1319,10 +1314,17 @@ func handleCreateOrder(c *gin.Context) {
 			sidesOrder = append(sidesOrder, it.Name)
 		}
 		sidesMap[it.Name] += it.Qty
+		sideTotalQty += it.Qty
 	}
 	sides := make([]OrderItem, 0, len(sidesOrder))
 	for _, sName := range sidesOrder {
 		sides = append(sides, OrderItem{Name: sName, Qty: sidesMap[sName]})
+	}
+
+	// Customer must select at least 1 item (Menu Paket, Menu Ala Carte, OR Add-ons)
+	if packagePortions <= 0 && alaTotalQty <= 0 && sideTotalQty <= 0 {
+		fail(c, http.StatusBadRequest, "Pilih minimal 1 menu atau add-on")
+		return
 	}
 
 	// 4. Normalize custom_items (only applies to Menu Paket portions)
