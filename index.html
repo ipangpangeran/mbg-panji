@@ -742,6 +742,16 @@
                 <span class="material-symbols-outlined text-[14px]">tune</span>
                 <span x-text="formatCustomOrder(o)"></span>
               </div>
+              <div class="flex items-center justify-end gap-2 pt-1.5 border-t border-slate-200/70">
+                <button type="button" @click="openEditOrder(o)"
+                        class="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-emerald-50 text-primary hover:bg-emerald-100 text-xs font-semibold transition">
+                  <span class="material-symbols-outlined text-[15px]">edit</span> Edit
+                </button>
+                <button type="button" @click="askDeleteOrder(o)"
+                        class="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-red-50 text-tertiary hover:bg-red-100 text-xs font-semibold transition">
+                  <span class="material-symbols-outlined text-[15px]">delete</span> Delete
+                </button>
+              </div>
             </div>
           </template>
         </div>
@@ -761,6 +771,7 @@
                 <th class="py-2.5 px-3 font-semibold">Add-ons</th>
                 <th class="py-2.5 px-3 font-semibold">Custom / Catatan</th>
                 <th class="py-2.5 px-3 font-semibold">Total</th>
+                <th class="py-2.5 px-3 font-semibold text-right">ACTION</th>
               </tr>
             </thead>
             <tbody>
@@ -785,6 +796,20 @@
                     <span x-show="!hasCustom(o)" class="text-on-surface-variant">-</span>
                   </td>
                   <td class="py-3 px-3 font-head font-bold text-primary whitespace-nowrap" x-text="o.total_price > 0 ? formatIDR(o.total_price) : '-'"></td>
+                  <td class="py-3 px-3 whitespace-nowrap text-right">
+                    <div class="inline-flex items-center justify-end gap-1.5">
+                      <button type="button" @click="openEditOrder(o)" title="Edit Pesanan"
+                              class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-emerald-50 text-primary hover:bg-emerald-100 text-xs font-semibold transition">
+                        <span class="material-symbols-outlined text-[15px]">edit</span>
+                        <span>Edit</span>
+                      </button>
+                      <button type="button" @click="askDeleteOrder(o)" title="Hapus Pesanan"
+                              class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-red-50 text-tertiary hover:bg-red-100 text-xs font-semibold transition">
+                        <span class="material-symbols-outlined text-[15px]">delete</span>
+                        <span>Delete</span>
+                      </button>
+                    </div>
+                  </td>
                 </tr>
               </template>
             </tbody>
@@ -853,6 +878,182 @@
   </div>
 </div>
 
+<!-- ===================== DELETE SINGLE ORDER MODAL ===================== -->
+<div x-cloak x-show="deleteTarget" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4" @keydown.escape.window="deleteTarget = null">
+  <div x-show="deleteTarget" x-transition.opacity class="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" @click="deleteTarget = null"></div>
+  <div x-show="deleteTarget" x-transition class="relative w-full max-w-sm bg-white rounded-3xl shadow-2xl p-6 text-center">
+    <div class="w-14 h-14 mx-auto rounded-full bg-red-50 text-tertiary flex items-center justify-center mb-3">
+      <span class="material-symbols-outlined text-[28px]">delete_forever</span>
+    </div>
+    <h4 class="font-head font-semibold text-lg">Hapus pesanan <span class="text-primary" x-text="deleteTarget ? '#' + String(deleteTarget.id).padStart(3,'0') : ''"></span>?</h4>
+    <p class="text-sm text-on-surface-variant mt-1">
+      Pesanan atas nama <b x-text="deleteTarget ? buyerWAGLabel(deleteTarget) : ''"></b> akan dihapus permanen<span x-show="deleteTarget && deleteTarget.quota_used > 0"> dan <b x-text="deleteTarget ? deleteTarget.quota_used : 0"></b> slot kuota dikembalikan</span>.
+    </p>
+    <div class="grid grid-cols-2 gap-2 mt-5">
+      <button type="button" @click="deleteTarget = null" :disabled="deletingOrder" class="py-3 rounded-full bg-surface-container-low font-semibold">Batal</button>
+      <button type="button" @click="confirmDeleteOrder()" :disabled="deletingOrder" class="py-3 rounded-full bg-tertiary text-white font-semibold" x-text="deletingOrder ? 'Menghapus…' : 'Ya, Hapus'"></button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== EDIT ORDER MODAL ===================== -->
+<div x-cloak x-show="editModal && editOrder" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4" @keydown.escape.window="if (!editSaving) editModal = false">
+  <div x-show="editModal" x-transition.opacity class="absolute inset-0 bg-slate-900/45 backdrop-blur-sm" @click="if (!editSaving) editModal = false"></div>
+  <div x-show="editModal && editOrder" x-transition class="relative w-full sm:max-w-lg bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl max-h-[92vh] flex flex-col overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-2.5">
+        <span class="px-2.5 py-1 rounded-xl bg-emerald-50 text-primary font-head font-bold text-sm" x-text="editOrder ? '#' + String(editOrder.id).padStart(3,'0') : ''"></span>
+        <div>
+          <h4 class="font-head font-semibold text-base">Edit Pesanan</h4>
+          <p class="text-xs text-on-surface-variant" x-text="editOrder ? 'Slot kuota saat ini: ' + editOrder.old_quota_used + ' porsi' : ''"></p>
+        </div>
+      </div>
+      <button type="button" @click="editModal = false" :disabled="editSaving" class="w-9 h-9 rounded-full bg-surface-container-low flex items-center justify-center text-on-surface-variant hover:text-on-surface">
+        <span class="material-symbols-outlined text-[20px]">close</span>
+      </button>
+    </div>
+
+    <form @submit.prevent="saveEditOrder()" class="flex-1 overflow-y-auto p-5 space-y-5">
+      <!-- Identitas -->
+      <div class="space-y-3">
+        <div class="space-y-1">
+          <label class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Nama Pemesan</label>
+          <input type="text" x-model="editOrder.name" @blur="editOrder.name = toTitleCaseName(editOrder.name)" maxlength="60" required class="field px-3.5 py-2.5 font-medium" />
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div class="space-y-1">
+            <label class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Info Lantai</label>
+            <input type="text" x-model="editOrder.floor" @blur="editOrder.floor = formatFloorInput(editOrder.floor)" maxlength="30" placeholder="cth : Lt 10" class="field px-3.5 py-2.5 font-medium" />
+          </div>
+          <div class="space-y-1">
+            <label class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Nomor HP</label>
+            <input type="tel" inputmode="tel" x-model="editOrder.phone" @input="editOrder.phone = editOrder.phone.replace(/[^0-9+]/g, '')" maxlength="18" placeholder="cth : 081234567890" class="field px-3.5 py-2.5 font-medium" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Menu Paket -->
+      <div class="space-y-2" x-show="editMenuOptions('main_menus', 'extra_mains').length">
+        <p class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Menu Paket</p>
+        <div class="space-y-2">
+          <template x-for="m in editMenuOptions('main_menus', 'extra_mains')" :key="'em-' + m">
+            <div class="flex items-center justify-between gap-3 p-3 rounded-2xl border"
+                 :class="(editOrder.main_qtys[m] || 0) > 0 ? 'bg-emerald-50/75 border-primary-container' : 'bg-surface-container-low border-transparent'">
+              <div class="min-w-0">
+                <p class="text-sm font-semibold truncate" x-text="shortName(m)"></p>
+                <p class="text-xs text-primary font-semibold" x-text="menuParts(m).priceLabel || 'Paket'"></p>
+              </div>
+              <div class="flex items-center gap-2 bg-white px-2 py-1 rounded-full border border-slate-100">
+                <button type="button" @click="adjEditQty('main_qtys', m, -1)" class="w-7 h-7 rounded-full bg-surface-container flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">remove</span>
+                </button>
+                <span class="font-head font-bold text-sm min-w-[18px] text-center" x-text="editOrder.main_qtys[m] || 0"></span>
+                <button type="button" @click="adjEditQty('main_qtys', m, 1)" class="w-7 h-7 rounded-full btn-primary text-white flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">add</span>
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Menu Ala Carte -->
+      <div class="space-y-2" x-show="editMenuOptions('alacarte_menus', 'extra_alacartes').length">
+        <p class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Menu Ala Carte</p>
+        <div class="space-y-2">
+          <template x-for="a in editMenuOptions('alacarte_menus', 'extra_alacartes')" :key="'ea-' + a">
+            <div class="flex items-center justify-between gap-3 p-3 rounded-2xl border"
+                 :class="(editOrder.alacarte_qtys[a] || 0) > 0 ? 'bg-amber-50/75 border-amber-300' : 'bg-surface-container-low border-transparent'">
+              <div class="min-w-0">
+                <p class="text-sm font-semibold truncate" x-text="shortName(a)"></p>
+                <p class="text-xs text-secondary font-semibold" x-text="(menuParts(a).priceLabel || '') + (isQuotaAlacarte(a) ? ' • Pakai kuota' : ' • Non-kuota')"></p>
+              </div>
+              <div class="flex items-center gap-2 bg-white px-2 py-1 rounded-full border border-slate-100">
+                <button type="button" @click="adjEditQty('alacarte_qtys', a, -1)" class="w-7 h-7 rounded-full bg-surface-container flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">remove</span>
+                </button>
+                <span class="font-head font-bold text-sm min-w-[18px] text-center" x-text="editOrder.alacarte_qtys[a] || 0"></span>
+                <button type="button" @click="adjEditQty('alacarte_qtys', a, 1)" class="w-7 h-7 rounded-full bg-secondary text-white flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">add</span>
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Add-ons -->
+      <div class="space-y-2" x-show="editMenuOptions('side_menus', 'extra_sides').length">
+        <p class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Add-ons</p>
+        <div class="space-y-2">
+          <template x-for="s in editMenuOptions('side_menus', 'extra_sides')" :key="'es-' + s">
+            <div class="flex items-center justify-between gap-3 p-3 rounded-2xl border"
+                 :class="(editOrder.side_qtys[s] || 0) > 0 ? 'bg-emerald-50/75 border-primary-container' : 'bg-surface-container-low border-transparent'">
+              <div class="min-w-0">
+                <p class="text-sm font-semibold truncate" x-text="shortName(s)"></p>
+                <p class="text-xs text-primary font-semibold" x-text="menuParts(s).priceLabel || 'Add-on'"></p>
+              </div>
+              <div class="flex items-center gap-2 bg-white px-2 py-1 rounded-full border border-slate-100">
+                <button type="button" @click="adjEditQty('side_qtys', s, -1)" class="w-7 h-7 rounded-full bg-surface-container flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">remove</span>
+                </button>
+                <span class="font-head font-bold text-sm min-w-[18px] text-center" x-text="editOrder.side_qtys[s] || 0"></span>
+                <button type="button" @click="adjEditQty('side_qtys', s, 1)" class="w-7 h-7 rounded-full btn-primary text-white flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">add</span>
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Custom Options (only when Menu Paket > 0) -->
+      <div class="space-y-2" x-show="editTotalMainQty > 0 && editMenuOptions('custom_options', 'extra_customs').length">
+        <p class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Custom Paket</p>
+        <div class="space-y-2">
+          <template x-for="co in editMenuOptions('custom_options', 'extra_customs')" :key="'ec-' + co">
+            <div class="flex items-center justify-between gap-3 p-3 rounded-2xl border"
+                 :class="(editOrder.custom_qtys[co] || 0) > 0 ? 'bg-amber-50/80 border-amber-300' : 'bg-surface-container-low border-transparent'">
+              <div class="min-w-0">
+                <p class="text-sm font-semibold truncate" x-text="shortName(co)"></p>
+                <p class="text-xs text-amber-800" x-text="customPriceHint(co)"></p>
+              </div>
+              <div class="flex items-center gap-2 bg-white px-2 py-1 rounded-full border border-slate-100">
+                <button type="button" @click="adjEditQty('custom_qtys', co, -1)" class="w-7 h-7 rounded-full bg-surface-container flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">remove</span>
+                </button>
+                <span class="font-head font-bold text-sm min-w-[18px] text-center" x-text="editOrder.custom_qtys[co] || 0"></span>
+                <button type="button" @click="adjEditQty('custom_qtys', co, 1)" class="w-7 h-7 rounded-full bg-amber-500 text-white flex items-center justify-center">
+                  <span class="material-symbols-outlined text-[15px]">add</span>
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Catatan -->
+      <div class="space-y-1">
+        <label class="text-xs font-semibold uppercase tracking-wider text-on-surface-variant">Catatan Tambahan</label>
+        <input type="text" x-model="editOrder.custom_note" maxlength="200" placeholder="cth : Sambal dipisah..." class="field px-3.5 py-2.5" />
+      </div>
+    </form>
+
+    <div class="px-5 py-4 border-t border-slate-100 bg-surface-container-low/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div>
+        <p class="text-xs text-on-surface-variant">Total Tagihan • Slot Kuota: <b x-text="editTotalQuotaSelected"></b></p>
+        <p class="font-head font-bold text-lg text-primary" x-text="formatIDR(editEstimatedTotal)"></p>
+      </div>
+      <div class="grid grid-cols-2 sm:flex gap-2">
+        <button type="button" @click="editModal = false" :disabled="editSaving" class="px-5 py-2.5 rounded-full bg-white border border-slate-200 font-semibold text-sm">Batal</button>
+        <button type="button" @click="saveEditOrder()" :disabled="editSaving" class="btn-primary px-6 py-2.5 rounded-full font-head font-semibold text-sm shadow">
+          <span x-text="editSaving ? 'Menyimpan…' : 'Simpan Perubahan'"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ===================== BOTTOM NAV ===================== -->
 <nav class="fixed bottom-0 inset-x-0 z-40 bg-surface/85 backdrop-blur-xl shadow-[0_-4px_20px_rgba(0,0,0,0.04)] pb-safe">
   <div class="max-w-md mx-auto flex justify-around items-center h-16">
@@ -915,6 +1116,8 @@ function app() {
     saving: false, togglingOpen: false, exporting: false, refreshing: false,
     quotaSyncStatus: '', quotaTimer: null, sseSource: null, orderPollTimer: null, adminPollTimer: null,
     confirmReset: false,
+    editModal: false, editSaving: false, editOrder: null,
+    deleteTarget: null, deletingOrder: false,
 
     get isRealtimeActive() {
       return Boolean(this.config && this.config.is_open && (this.config.remaining || 0) > 0);
@@ -943,27 +1146,49 @@ function app() {
     get totalSelectedCount() {
       return this.totalMainQty + this.totalAlacarteQty + this.totalSideQty;
     },
-    get estimatedTotal() {
+    get editTotalMainQty() {
+      if (!this.editOrder) return 0;
+      return Object.values(this.editOrder.main_qtys || {}).reduce((s, q) => s + (q || 0), 0);
+    },
+    get editTotalQuotaSelected() {
+      if (!this.editOrder) return 0;
+      const alaQuota = Object.entries(this.editOrder.alacarte_qtys || {}).reduce(
+        (s, [k, q]) => s + (q > 0 && this.isQuotaAlacarte(k) ? q : 0),
+        0
+      );
+      return this.editTotalMainQty + alaQuota;
+    },
+    get editEstimatedTotal() {
+      if (!this.editOrder) return 0;
+      return this.calcMenusTotal(
+        this.editOrder.main_qtys,
+        this.editOrder.alacarte_qtys,
+        this.editOrder.side_qtys,
+        this.editOrder.custom_qtys,
+        this.editTotalMainQty
+      );
+    },
+    calcMenusTotal(mainQtys, alaQtys, sideQtys, customQtys, mainCount) {
       let total = 0;
-      (this.config.main_menus || []).forEach(m => {
-        const q = this.form.main_qtys[m] || 0;
-        if (q > 0) total += q * this.menuParts(m).priceNum;
-      });
-      (this.config.alacarte_menus || []).forEach(a => {
-        const q = this.form.alacarte_qtys[a] || 0;
-        if (q > 0) total += q * this.menuParts(a).priceNum;
-      });
-      (this.config.side_menus || []).forEach(s => {
-        const q = this.form.side_qtys[s] || 0;
-        if (q > 0) total += q * this.menuParts(s).priceNum;
-      });
-      if (this.totalMainQty > 0) {
-        (this.config.custom_options || []).forEach(co => {
-          const q = this.getCustomQty(co);
-          if (q > 0) total += q * this.menuParts(co).priceNum;
+      const addMap = (qtys) => {
+        Object.entries(qtys || {}).forEach(([name, q]) => {
+          if (q > 0) total += q * this.menuParts(name).priceNum;
         });
-      }
+      };
+      addMap(mainQtys);
+      addMap(alaQtys);
+      addMap(sideQtys);
+      if (mainCount > 0) addMap(customQtys);
       return Math.max(0, total);
+    },
+    get estimatedTotal() {
+      return this.calcMenusTotal(
+        this.form.main_qtys,
+        this.form.alacarte_qtys,
+        this.form.side_qtys,
+        this.form.custom_qtys,
+        this.totalMainQty
+      );
     },
 
     isQuotaAlacarte(a) {
@@ -1541,6 +1766,123 @@ function app() {
         this.notify('Data pesanan direset');
         await this.refreshAdmin(false, false);
       } catch (e) { this.notify(e.message, 'error'); }
+    },
+    editMenuOptions(cfgKey, extraKey) {
+      const base = (this.config && this.config[cfgKey]) || [];
+      const extra = (this.editOrder && this.editOrder[extraKey]) || [];
+      return [...base, ...extra];
+    },
+    openEditOrder(o) {
+      const toQtyState = (items, cfgList) => {
+        const map = {};
+        const extra = [];
+        (items || []).forEach(it => {
+          if (!it || !it.name || it.qty <= 0) return;
+          map[it.name] = (map[it.name] || 0) + it.qty;
+          if (!(cfgList || []).includes(it.name) && !extra.includes(it.name)) extra.push(it.name);
+        });
+        return { map, extra };
+      };
+      const m = toQtyState(o.main_menus, this.config.main_menus);
+      const a = toQtyState(o.alacarte_menus, this.config.alacarte_menus);
+      const s = toQtyState(o.side_menus, this.config.side_menus);
+      const c = toQtyState(o.custom_items, this.config.custom_options);
+      this.editOrder = {
+        id: o.id,
+        name: o.name || '',
+        floor: o.floor || '',
+        phone: o.phone || '',
+        had_floor: Boolean(o.floor),
+        had_phone: Boolean(o.phone),
+        old_quota_used: o.quota_used || 0,
+        main_qtys: m.map, extra_mains: m.extra,
+        alacarte_qtys: a.map, extra_alacartes: a.extra,
+        side_qtys: s.map, extra_sides: s.extra,
+        custom_qtys: c.map, extra_customs: c.extra,
+        custom_note: o.custom_note || '',
+        payment_method: o.payment_method || 'cash',
+      };
+      this.editModal = true;
+    },
+    adjEditQty(groupKey, name, delta) {
+      if (!this.editOrder) return;
+      const map = this.editOrder[groupKey];
+      const next = Math.max(0, (map[name] || 0) + delta);
+      if (groupKey === 'custom_qtys') {
+        map[name] = Math.min(next, this.editTotalMainQty);
+      } else {
+        map[name] = next;
+      }
+      if (groupKey === 'main_qtys') {
+        const maxC = this.editTotalMainQty;
+        Object.keys(this.editOrder.custom_qtys).forEach(k => {
+          if (this.editOrder.custom_qtys[k] > maxC) this.editOrder.custom_qtys[k] = maxC;
+        });
+      }
+    },
+    async saveEditOrder() {
+      if (!this.editOrder || this.editSaving) return;
+      const eo = this.editOrder;
+      if (!eo.name.trim()) return this.notify('Nama pemesan wajib diisi', 'error');
+      if (eo.had_floor && !eo.floor.trim()) return this.notify('Info lantai wajib diisi', 'error');
+      const phoneClean = (eo.phone || '').replace(/[^0-9+]/g, '');
+      if ((eo.had_phone || phoneClean) && phoneClean.replace(/\D/g, '').length < 8) {
+        return this.notify('Nomor HP minimal 8 digit', 'error');
+      }
+      const toList = (options, qtyMap) => options
+        .map(name => ({ name, qty: qtyMap[name] || 0 }))
+        .filter(x => x.qty > 0);
+      const main_menus = toList(this.editMenuOptions('main_menus', 'extra_mains'), eo.main_qtys);
+      const alacarte_menus = toList(this.editMenuOptions('alacarte_menus', 'extra_alacartes'), eo.alacarte_qtys);
+      const side_menus = toList(this.editMenuOptions('side_menus', 'extra_sides'), eo.side_qtys);
+      if (!main_menus.length && !alacarte_menus.length && !side_menus.length) {
+        return this.notify('Minimal 1 menu atau add-on harus dipilih', 'error');
+      }
+      const custom_items = main_menus.length
+        ? toList(this.editMenuOptions('custom_options', 'extra_customs'), eo.custom_qtys)
+        : [];
+      const payload = {
+        name: this.toTitleCaseName(eo.name),
+        floor: this.formatFloorInput(eo.floor),
+        phone: phoneClean,
+        main_menus,
+        alacarte_menus,
+        side_menus,
+        custom_items,
+        custom_note: (eo.custom_note || '').trim(),
+        payment_method: eo.payment_method || 'cash',
+      };
+      this.editSaving = true;
+      try {
+        await this.api(`/api/orders/${eo.id}`, { method: 'PUT', body: JSON.stringify(payload) });
+        this.editModal = false;
+        this.editOrder = null;
+        this.notify(`Pesanan #${String(eo.id).padStart(3, '0')} diperbarui`);
+        await this.refreshAdmin(false, false);
+      } catch (e) {
+        this.notify(e.message, 'error');
+      } finally {
+        this.editSaving = false;
+      }
+    },
+    askDeleteOrder(o) {
+      this.deleteTarget = o;
+    },
+    async confirmDeleteOrder() {
+      if (!this.deleteTarget || this.deletingOrder) return;
+      const target = this.deleteTarget;
+      this.deletingOrder = true;
+      try {
+        await this.api(`/api/orders/${target.id}`, { method: 'DELETE' });
+        this.deleteTarget = null;
+        const quotaMsg = target.quota_used > 0 ? ` (${target.quota_used} kuota dikembalikan)` : '';
+        this.notify(`Pesanan #${String(target.id).padStart(3, '0')} dihapus${quotaMsg}`);
+        await this.refreshAdmin(false, false);
+      } catch (e) {
+        this.notify(e.message, 'error');
+      } finally {
+        this.deletingOrder = false;
+      }
     },
     async exportExcel() {
       this.exporting = true;

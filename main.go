@@ -839,6 +839,15 @@ func contains(list []string, v string) bool {
 	return false
 }
 
+func containsItemName(items []OrderItem, v string) bool {
+	for _, it := range items {
+		if it.Name == v {
+			return true
+		}
+	}
+	return false
+}
+
 func paymentLabel(p string) string {
 	switch p {
 	case "qris":
@@ -1221,57 +1230,184 @@ func handleUpdateConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "pin_changed": pinChanged})
 }
 
-// POST /api/order (public) — accepts Menu Paket, Ala Carte (standalone or combined), and Add-ons.
-func handleCreateOrder(c *gin.Context) {
-	var req struct {
-		Name             string          `json:"name"`
-		Floor            string          `json:"floor"`
-		Phone            string          `json:"phone"`
-		MainMenu         string          `json:"main_menu"`
-		MainMenus        []OrderItem     `json:"main_menus"`
-		AlacarteMenus    []OrderItem     `json:"alacarte_menus"`
-		SideMenusRaw     json.RawMessage `json:"side_menus"`
-		CustomItems      []OrderItem     `json:"custom_items"`
-		CustomOptionsRaw json.RawMessage `json:"custom_options"`
-		CustomNote       string          `json:"custom_note"`
-		PaymentMethod    string          `json:"payment_method"`
+type orderPayloadReq struct {
+	Name             string          `json:"name"`
+	Floor            string          `json:"floor"`
+	Phone            string          `json:"phone"`
+	MainMenu         string          `json:"main_menu"`
+	MainMenus        []OrderItem     `json:"main_menus"`
+	AlacarteMenus    []OrderItem     `json:"alacarte_menus"`
+	SideMenusRaw     json.RawMessage `json:"side_menus"`
+	CustomItems      []OrderItem     `json:"custom_items"`
+	CustomOptionsRaw json.RawMessage `json:"custom_options"`
+	CustomNote       string          `json:"custom_note"`
+	PaymentMethod    string          `json:"payment_method"`
+}
+
+type normalizedOrderData struct {
+	Name            string
+	Floor           string
+	Phone           string
+	Pay             string
+	Note            string
+	Mains           []OrderItem
+	Alacartes       []OrderItem
+	Sides           []OrderItem
+	Customs         []OrderItem
+	CustomLabels    []string
+	MainMenuSummary string
+	QuotaNeeded     int
+	TotalPrice      int
+}
+
+func normalizeOrderItems(inputs []OrderItem, allowed []string, existing []OrderItem, kindLabel string) ([]OrderItem, int, string) {
+	qtyMap := map[string]int{}
+	order := []string{}
+	total := 0
+	for _, it := range inputs {
+		if it.Qty <= 0 {
+			continue
+		}
+		if it.Qty > maxItemQty {
+			return nil, 0, fmt.Sprintf("Jumlah %s maksimal %d per item", kindLabel, maxItemQty)
+		}
+		if !contains(allowed, it.Name) && !containsItemName(existing, it.Name) {
+			return nil, 0, fmt.Sprintf("%s tidak tersedia: %s", titleCaseName(kindLabel), it.Name)
+		}
+		if _, seen := qtyMap[it.Name]; !seen {
+			order = append(order, it.Name)
+		}
+		qtyMap[it.Name] += it.Qty
+		total += it.Qty
 	}
+	out := make([]OrderItem, 0, len(order))
+	for _, name := range order {
+		out = append(out, OrderItem{Name: name, Qty: qtyMap[name]})
+	}
+	return out, total, ""
+}
+
+func parseAndNormalizeOrder(c *gin.Context, cfg AppConfig, requireContact bool, existing *Order) (*normalizedOrderData, bool) {
+	var req orderPayloadReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		fail(c, http.StatusBadRequest, "Format permintaan tidak valid")
-		return
+		return nil, false
 	}
 	name := titleCaseName(req.Name)
 	if name == "" {
 		fail(c, http.StatusBadRequest, "Nama wajib diisi")
-		return
+		return nil, false
 	}
 	if len([]rune(name)) > maxNameLen {
 		fail(c, http.StatusBadRequest, fmt.Sprintf("Nama maksimal %d karakter", maxNameLen))
-		return
+		return nil, false
 	}
 	floor := normalizeFloor(req.Floor)
-	if floor == "" {
+	if requireContact && floor == "" {
 		fail(c, http.StatusBadRequest, "Info lantai wajib diisi")
-		return
+		return nil, false
 	}
 	if len([]rune(floor)) > 30 {
 		floor = string([]rune(floor)[:30])
 	}
 	phone := normalizePhone(req.Phone)
-	if len(phone) < 8 || len(phone) > 18 {
+	if (requireContact || phone != "") && (len(phone) < 8 || len(phone) > 18) {
 		fail(c, http.StatusBadRequest, "Nomor HP wajib diisi (8-18 digit)")
-		return
+		return nil, false
 	}
 	pay := strings.ToLower(strings.TrimSpace(req.PaymentMethod))
 	if pay == "" {
 		pay = "-"
 	}
-
 	note := strings.Join(strings.Fields(req.CustomNote), " ")
 	if r := []rune(note); len(r) > maxNoteLen {
 		note = string(r[:maxNoteLen])
 	}
 
+	var exMains, exAla, exSides, exCustoms []OrderItem
+	if existing != nil {
+		exMains = existing.MainMenus
+		exAla = existing.AlacarteMenus
+		exSides = existing.SideMenus
+		exCustoms = existing.CustomItems
+	}
+
+	mainsInput := req.MainMenus
+	if len(mainsInput) == 0 && strings.TrimSpace(req.MainMenu) != "" {
+		mainsInput = []OrderItem{{Name: strings.TrimSpace(req.MainMenu), Qty: 1}}
+	}
+	mains, packagePortions, errMsg := normalizeOrderItems(mainsInput, cfg.MainMenus, exMains, "menu paket")
+	if errMsg != "" {
+		fail(c, http.StatusBadRequest, errMsg)
+		return nil, false
+	}
+
+	alacartes, alaTotalQty, errMsg := normalizeOrderItems(req.AlacarteMenus, cfg.AlacarteMenus, exAla, "menu ala carte")
+	if errMsg != "" {
+		fail(c, http.StatusBadRequest, errMsg)
+		return nil, false
+	}
+
+	sidesParsed := parseOrderItems(string(req.SideMenusRaw))
+	sides, sideTotalQty, errMsg := normalizeOrderItems(sidesParsed, cfg.SideMenus, exSides, "add-on")
+	if errMsg != "" {
+		fail(c, http.StatusBadRequest, errMsg)
+		return nil, false
+	}
+
+	if packagePortions <= 0 && alaTotalQty <= 0 && sideTotalQty <= 0 {
+		fail(c, http.StatusBadRequest, "Pilih minimal 1 menu atau add-on")
+		return nil, false
+	}
+
+	customsInput := req.CustomItems
+	if len(customsInput) == 0 && len(req.CustomOptionsRaw) > 0 {
+		customsInput = parseOrderItems(string(req.CustomOptionsRaw))
+	}
+	var customs []OrderItem
+	if packagePortions > 0 {
+		customs, _, errMsg = normalizeOrderItems(customsInput, cfg.CustomOptions, exCustoms, "opsi custom")
+		if errMsg != "" {
+			fail(c, http.StatusBadRequest, errMsg)
+			return nil, false
+		}
+		for i := range customs {
+			if customs[i].Qty > packagePortions {
+				customs[i].Qty = packagePortions
+			}
+		}
+	} else {
+		customs = []OrderItem{}
+	}
+
+	customLabels := make([]string, 0, len(customs))
+	for _, ci := range customs {
+		if ci.Qty > 1 {
+			customLabels = append(customLabels, fmt.Sprintf("%dx %s", ci.Qty, shortMenuName(ci.Name)))
+		} else {
+			customLabels = append(customLabels, shortMenuName(ci.Name))
+		}
+	}
+
+	return &normalizedOrderData{
+		Name:            name,
+		Floor:           floor,
+		Phone:           phone,
+		Pay:             pay,
+		Note:            note,
+		Mains:           mains,
+		Alacartes:       alacartes,
+		Sides:           sides,
+		Customs:         customs,
+		CustomLabels:    customLabels,
+		MainMenuSummary: formatItems(mains),
+		QuotaNeeded:     calcQuotaUsed(mains, alacartes),
+		TotalPrice:      calcOrderTotal(mains, alacartes, sides, customs),
+	}, true
+}
+
+// POST /api/order (public) — accepts Menu Paket, Ala Carte (standalone or combined), and Add-ons.
+func handleCreateOrder(c *gin.Context) {
 	orderMu.Lock()
 	defer orderMu.Unlock()
 
@@ -1285,137 +1421,11 @@ func handleCreateOrder(c *gin.Context) {
 		return
 	}
 
-	// 1. Normalize main_menus (Menu Paket)
-	mainsInput := req.MainMenus
-	if len(mainsInput) == 0 && strings.TrimSpace(req.MainMenu) != "" {
-		mainsInput = []OrderItem{{Name: strings.TrimSpace(req.MainMenu), Qty: 1}}
-	}
-	mainsMap := map[string]int{}
-	mainsOrder := []string{}
-	packagePortions := 0
-	for _, it := range mainsInput {
-		if it.Qty <= 0 {
-			continue
-		}
-		if it.Qty > maxItemQty {
-			fail(c, http.StatusBadRequest, fmt.Sprintf("Jumlah porsi maksimal %d per menu", maxItemQty))
-			return
-		}
-		if !contains(cfg.MainMenus, it.Name) {
-			fail(c, http.StatusBadRequest, "Menu paket tidak tersedia: "+it.Name)
-			return
-		}
-		if _, seen := mainsMap[it.Name]; !seen {
-			mainsOrder = append(mainsOrder, it.Name)
-		}
-		mainsMap[it.Name] += it.Qty
-		packagePortions += it.Qty
-	}
-	mains := make([]OrderItem, 0, len(mainsOrder))
-	for _, mName := range mainsOrder {
-		mains = append(mains, OrderItem{Name: mName, Qty: mainsMap[mName]})
-	}
-
-	// 2. Normalize alacarte_menus (Menu Ala Carte / Pecahan Paket)
-	alaMap := map[string]int{}
-	alaOrder := []string{}
-	alaTotalQty := 0
-	for _, it := range req.AlacarteMenus {
-		if it.Qty <= 0 {
-			continue
-		}
-		if it.Qty > maxItemQty {
-			fail(c, http.StatusBadRequest, fmt.Sprintf("Jumlah ala carte maksimal %d per item", maxItemQty))
-			return
-		}
-		if !contains(cfg.AlacarteMenus, it.Name) {
-			fail(c, http.StatusBadRequest, "Menu ala carte tidak tersedia: "+it.Name)
-			return
-		}
-		if _, seen := alaMap[it.Name]; !seen {
-			alaOrder = append(alaOrder, it.Name)
-		}
-		alaMap[it.Name] += it.Qty
-		alaTotalQty += it.Qty
-	}
-	alacartes := make([]OrderItem, 0, len(alaOrder))
-	for _, aName := range alaOrder {
-		alacartes = append(alacartes, OrderItem{Name: aName, Qty: alaMap[aName]})
-	}
-
-	// 3. Normalize side_menus (Add-ons)
-	sidesParsed := parseOrderItems(string(req.SideMenusRaw))
-	sidesMap := map[string]int{}
-	sidesOrder := []string{}
-	sideTotalQty := 0
-	for _, it := range sidesParsed {
-		if it.Qty <= 0 {
-			continue
-		}
-		if it.Qty > maxItemQty {
-			fail(c, http.StatusBadRequest, fmt.Sprintf("Jumlah add-on maksimal %d per item", maxItemQty))
-			return
-		}
-		if !contains(cfg.SideMenus, it.Name) {
-			fail(c, http.StatusBadRequest, "Add-on tidak tersedia: "+it.Name)
-			return
-		}
-		if _, seen := sidesMap[it.Name]; !seen {
-			sidesOrder = append(sidesOrder, it.Name)
-		}
-		sidesMap[it.Name] += it.Qty
-		sideTotalQty += it.Qty
-	}
-	sides := make([]OrderItem, 0, len(sidesOrder))
-	for _, sName := range sidesOrder {
-		sides = append(sides, OrderItem{Name: sName, Qty: sidesMap[sName]})
-	}
-
-	// Customer must select at least 1 item (Menu Paket, Menu Ala Carte, OR Add-ons)
-	if packagePortions <= 0 && alaTotalQty <= 0 && sideTotalQty <= 0 {
-		fail(c, http.StatusBadRequest, "Pilih minimal 1 menu atau add-on")
+	data, ok := parseAndNormalizeOrder(c, cfg, true, nil)
+	if !ok {
 		return
 	}
 
-	// 4. Normalize custom_items (only applies to Menu Paket portions)
-	customsInput := req.CustomItems
-	if len(customsInput) == 0 && len(req.CustomOptionsRaw) > 0 {
-		customsInput = parseOrderItems(string(req.CustomOptionsRaw))
-	}
-	customsMap := map[string]int{}
-	customsOrder := []string{}
-	if packagePortions > 0 {
-		for _, it := range customsInput {
-			if it.Qty <= 0 {
-				continue
-			}
-			if !contains(cfg.CustomOptions, it.Name) {
-				fail(c, http.StatusBadRequest, "Opsi custom tidak tersedia: "+it.Name)
-				return
-			}
-			if _, seen := customsMap[it.Name]; !seen {
-				customsOrder = append(customsOrder, it.Name)
-			}
-			customsMap[it.Name] += it.Qty
-			if customsMap[it.Name] > packagePortions {
-				customsMap[it.Name] = packagePortions
-			}
-		}
-	}
-	customs := make([]OrderItem, 0, len(customsOrder))
-	customLabels := make([]string, 0, len(customsOrder))
-	for _, cName := range customsOrder {
-		q := customsMap[cName]
-		customs = append(customs, OrderItem{Name: cName, Qty: q})
-		if q > 1 {
-			customLabels = append(customLabels, fmt.Sprintf("%dx %s", q, shortMenuName(cName)))
-		} else {
-			customLabels = append(customLabels, shortMenuName(cName))
-		}
-	}
-
-	// 5. Quota validation: Menu Paket portions + Lauk Ala Carte portions consume daily quota
-	quotaNeeded := calcQuotaUsed(mains, alacartes)
 	used, err := countUsedQuota()
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menghitung pesanan")
@@ -1426,56 +1436,168 @@ func handleCreateOrder(c *gin.Context) {
 		fail(c, http.StatusConflict, "MBG Sold Out. Silahkan chat admin untuk order manual jika masih ada.")
 		return
 	}
-	if quotaNeeded > remaining {
-		fail(c, http.StatusConflict, fmt.Sprintf("Maaf, sisa kuota tinggal %d porsi (kamu memilih %d porsi)", remaining, quotaNeeded))
+	if data.QuotaNeeded > remaining {
+		fail(c, http.StatusConflict, fmt.Sprintf("Maaf, sisa kuota tinggal %d porsi (kamu memilih %d porsi)", remaining, data.QuotaNeeded))
 		return
 	}
 
-	totalPrice := calcOrderTotal(mains, alacartes, sides, customs)
-	mainsJSON, _ := json.Marshal(mains)
-	alacartesJSON, _ := json.Marshal(alacartes)
-	sidesJSON, _ := json.Marshal(sides)
-	customsJSON, _ := json.Marshal(customs)
-	mainMenuSummary := formatItems(mains)
+	mainsJSON, _ := json.Marshal(data.Mains)
+	alacartesJSON, _ := json.Marshal(data.Alacartes)
+	sidesJSON, _ := json.Marshal(data.Sides)
+	customsJSON, _ := json.Marshal(data.Customs)
 	ts := time.Now().In(loc).Format(timeLayout)
 
 	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, floor, phone, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, quota_used, total_price, payment_method, status)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ts, name, floor, phone, mainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), note, quotaNeeded, totalPrice, pay, "baru")
+		ts, data.Name, data.Floor, data.Phone, data.MainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), data.Note, data.QuotaNeeded, data.TotalPrice, data.Pay, "baru")
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menyimpan pesanan")
 		return
 	}
 	id, _ := res.LastInsertId()
-	newRemaining := remaining - quotaNeeded
+	newRemaining := remaining - data.QuotaNeeded
 	if newRemaining < 0 {
 		newRemaining = 0
 	}
-	// Broadcast updated remaining quota immediately to all connected devices!
 	go eventsHub.broadcastState()
 	c.JSON(http.StatusCreated, gin.H{
 		"ok":      true,
-		"message": "Terima kasih, " + name + "!",
+		"message": "Terima kasih, " + data.Name + "!",
 		"order": Order{
 			ID:            id,
 			Timestamp:     ts,
-			Name:          name,
-			Floor:         floor,
-			Phone:         phone,
-			MainMenus:     mains,
-			MainMenu:      mainMenuSummary,
-			AlacarteMenus: alacartes,
-			SideMenus:     sides,
-			CustomItems:   customs,
-			CustomOptions: customLabels,
-			CustomNote:    note,
-			QuotaUsed:     quotaNeeded,
-			TotalPrice:    totalPrice,
-			PaymentMethod: pay,
+			Name:          data.Name,
+			Floor:         data.Floor,
+			Phone:         data.Phone,
+			MainMenus:     data.Mains,
+			MainMenu:      data.MainMenuSummary,
+			AlacarteMenus: data.Alacartes,
+			SideMenus:     data.Sides,
+			CustomItems:   data.Customs,
+			CustomOptions: data.CustomLabels,
+			CustomNote:    data.Note,
+			QuotaUsed:     data.QuotaNeeded,
+			TotalPrice:    data.TotalPrice,
+			PaymentMethod: data.Pay,
 			Status:        "baru",
 		},
 		"remaining": newRemaining,
 	})
+}
+
+// PUT /api/orders/:id (admin) — updates an order's details & recalculates quota/price.
+func handleUpdateOrder(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		fail(c, http.StatusBadRequest, "ID pesanan tidak valid")
+		return
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+
+	orders, err := listOrders()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca pesanan")
+		return
+	}
+	var existing *Order
+	used := 0
+	for i := range orders {
+		used += orders[i].QuotaUsed
+		if orders[i].ID == id {
+			existing = &orders[i]
+		}
+	}
+	if existing == nil {
+		fail(c, http.StatusNotFound, "Pesanan tidak ditemukan")
+		return
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal membaca konfigurasi")
+		return
+	}
+
+	data, ok := parseAndNormalizeOrder(c, cfg, false, existing)
+	if !ok {
+		return
+	}
+
+	// Only enforce quota limit when the edit increases quota consumption beyond available remaining slots
+	if data.QuotaNeeded > existing.QuotaUsed {
+		availableForOrder := cfg.GlobalQuota - (used - existing.QuotaUsed)
+		if data.QuotaNeeded > availableForOrder {
+			rem := cfg.GlobalQuota - used
+			if rem < 0 {
+				rem = 0
+			}
+			fail(c, http.StatusConflict, fmt.Sprintf("Sisa kuota tidak cukup untuk menambah porsi (tersisa %d slot)", rem))
+			return
+		}
+	}
+
+	mainsJSON, _ := json.Marshal(data.Mains)
+	alacartesJSON, _ := json.Marshal(data.Alacartes)
+	sidesJSON, _ := json.Marshal(data.Sides)
+	customsJSON, _ := json.Marshal(data.Customs)
+
+	_, err = db.Exec(`UPDATE Orders SET name=?, floor=?, phone=?, main_menu=?, main_menus_json=?, alacarte_menus_json=?, side_menus_json=?, custom_options_json=?, custom_note=?, quota_used=?, total_price=?, payment_method=? WHERE id=?`,
+		data.Name, data.Floor, data.Phone, data.MainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), data.Note, data.QuotaNeeded, data.TotalPrice, data.Pay, id)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal memperbarui pesanan")
+		return
+	}
+
+	go eventsHub.broadcastState()
+	c.JSON(http.StatusOK, gin.H{
+		"ok": true,
+		"order": Order{
+			ID:            existing.ID,
+			Timestamp:     existing.Timestamp,
+			Name:          data.Name,
+			Floor:         data.Floor,
+			Phone:         data.Phone,
+			MainMenus:     data.Mains,
+			MainMenu:      data.MainMenuSummary,
+			AlacarteMenus: data.Alacartes,
+			SideMenus:     data.Sides,
+			CustomItems:   data.Customs,
+			CustomOptions: data.CustomLabels,
+			CustomNote:    data.Note,
+			QuotaUsed:     data.QuotaNeeded,
+			TotalPrice:    data.TotalPrice,
+			PaymentMethod: data.Pay,
+			Status:        existing.Status,
+		},
+	})
+}
+
+// DELETE /api/orders/:id (admin) — deletes a single order and immediately restores its quota.
+func handleDeleteOrder(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		fail(c, http.StatusBadRequest, "ID pesanan tidak valid")
+		return
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+
+	res, err := db.Exec(`DELETE FROM Orders WHERE id = ?`, id)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, "Gagal menghapus pesanan")
+		return
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		fail(c, http.StatusNotFound, "Pesanan tidak ditemukan")
+		return
+	}
+
+	go eventsHub.broadcastState()
+	c.JSON(http.StatusOK, gin.H{"ok": true, "deleted_id": id})
 }
 
 // GET /api/orders (admin)
@@ -1775,6 +1897,8 @@ func main() {
 		admin := api.Group("", adminAuth())
 		admin.POST("/config", handleUpdateConfig)
 		admin.GET("/orders", handleListOrders)
+		admin.PUT("/orders/:id", handleUpdateOrder)
+		admin.DELETE("/orders/:id", handleDeleteOrder)
 		admin.DELETE("/orders", handleResetOrders)
 		admin.GET("/summary", handleSummary)
 		admin.GET("/export/excel", handleExportExcel)
