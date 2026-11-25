@@ -170,14 +170,39 @@
 
     <form @submit.prevent="submitOrder()" class="glass rounded-3xl shadow-card p-5 space-y-6"
           :class="(!config.is_open || config.remaining <= 0) && 'opacity-55 pointer-events-none select-none'">
-      <!-- 1. Nama Pemesan -->
-      <div class="space-y-2">
-        <label for="name" class="block text-sm font-semibold">Nama Pemesan</label>
-        <div class="relative">
-          <span class="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-on-surface-variant text-[22px] pointer-events-none">person</span>
-          <input id="name" type="text" x-model="form.name" @blur="form.name = toTitleCaseName(form.name)"
-                 maxlength="60" autocomplete="name" autocapitalize="words" required
-                 placeholder="Input Nama & Lantai (cth: Ipang Lt 10)" class="field pl-12 pr-4 py-3.5 font-medium capitalize" />
+      <!-- 1. Identitas Pemesan (Nama, Info Lantai & Nomor HP) -->
+      <div class="space-y-3.5">
+        <div class="space-y-1.5">
+          <label for="name" class="block text-sm font-semibold">Nama Pemesan</label>
+          <div class="relative">
+            <span class="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-on-surface-variant text-[21px] pointer-events-none">person</span>
+            <input id="name" type="text" x-model="form.name" @blur="form.name = toTitleCaseName(form.name)"
+                   maxlength="60" autocomplete="name" autocapitalize="words" required
+                   placeholder="cth : Panji" class="field pl-11 pr-4 py-3.5 font-medium capitalize" />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+          <div class="space-y-1.5">
+            <label for="floor" class="block text-sm font-semibold">Info Lantai</label>
+            <div class="relative">
+              <span class="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-on-surface-variant text-[20px] pointer-events-none">apartment</span>
+              <input id="floor" type="text" x-model="form.floor" @blur="form.floor = formatFloorInput(form.floor)"
+                     maxlength="30" required
+                     placeholder="cth : Lt 10" class="field pl-11 pr-4 py-3.5 font-medium" />
+            </div>
+          </div>
+
+          <div class="space-y-1.5">
+            <label for="phone" class="block text-sm font-semibold">Nomor HP</label>
+            <div class="relative">
+              <span class="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-on-surface-variant text-[20px] pointer-events-none">call</span>
+              <input id="phone" type="tel" inputmode="tel" x-model="form.phone"
+                     @input="form.phone = form.phone.replace(/[^0-9+]/g, '')"
+                     maxlength="18" autocomplete="tel" required
+                     placeholder="cth : 081234567890" class="field pl-11 pr-4 py-3.5 font-medium" />
+            </div>
+          </div>
         </div>
       </div>
 
@@ -694,8 +719,16 @@
           <template x-for="o in orders" :key="'c-' + o.id">
             <div class="p-3.5 rounded-2xl bg-surface-container-low space-y-1.5">
               <div class="flex items-center justify-between gap-2">
-                <p class="font-semibold truncate"><span class="text-primary font-bold" x-text="'#' + String(o.id).padStart(3,'0')"></span> <span x-text="o.name"></span></p>
+                <div class="flex items-center flex-wrap gap-1.5 min-w-0">
+                  <span class="text-primary font-bold" x-text="'#' + String(o.id).padStart(3,'0')"></span>
+                  <span class="font-semibold truncate" x-text="o.name"></span>
+                  <span x-show="o.floor" class="px-2 py-0.5 rounded-full bg-emerald-100/80 text-primary text-[11px] font-bold" x-text="o.floor"></span>
+                </div>
                 <span class="text-xs font-semibold text-on-surface-variant flex-shrink-0" x-text="timeOf(o.timestamp)"></span>
+              </div>
+              <div x-show="o.phone" class="flex items-center gap-1 text-xs text-on-surface-variant">
+                <span class="material-symbols-outlined text-[14px] text-primary">call</span>
+                <a :href="waLink(o.phone)" target="_blank" rel="noopener" class="font-medium text-primary hover:underline" x-text="o.phone"></a>
               </div>
               <div class="flex items-start justify-between gap-2">
                 <div class="space-y-0.5 min-w-0">
@@ -720,7 +753,9 @@
               <tr class="text-left text-xs uppercase tracking-wider text-on-surface-variant">
                 <th class="py-2.5 px-3 font-semibold">#</th>
                 <th class="py-2.5 px-3 font-semibold">Waktu</th>
-                <th class="py-2.5 px-3 font-semibold">Nama &amp; Lantai</th>
+                <th class="py-2.5 px-3 font-semibold">Nama</th>
+                <th class="py-2.5 px-3 font-semibold">Lantai</th>
+                <th class="py-2.5 px-3 font-semibold">Nomor HP</th>
                 <th class="py-2.5 px-3 font-semibold">Menu Paket</th>
                 <th class="py-2.5 px-3 font-semibold">Ala Carte</th>
                 <th class="py-2.5 px-3 font-semibold">Add-ons</th>
@@ -734,6 +769,14 @@
                   <td class="py-3 px-3 font-bold text-primary" x-text="String(o.id).padStart(3,'0')"></td>
                   <td class="py-3 px-3 text-on-surface-variant whitespace-nowrap" x-text="timeOf(o.timestamp)"></td>
                   <td class="py-3 px-3 font-semibold" x-text="o.name"></td>
+                  <td class="py-3 px-3 whitespace-nowrap">
+                    <span x-show="o.floor" class="px-2 py-0.5 rounded-full bg-emerald-50 text-primary text-xs font-semibold" x-text="o.floor"></span>
+                    <span x-show="!o.floor" class="text-on-surface-variant">-</span>
+                  </td>
+                  <td class="py-3 px-3 whitespace-nowrap">
+                    <a x-show="o.phone" :href="waLink(o.phone)" target="_blank" rel="noopener" class="text-primary font-medium hover:underline" x-text="o.phone"></a>
+                    <span x-show="!o.phone" class="text-on-surface-variant">-</span>
+                  </td>
                   <td class="py-3 px-3 font-medium" x-text="formatItemList(o.main_menus) || '-'"></td>
                   <td class="py-3 px-3 text-secondary font-medium" x-text="formatItemList(o.alacarte_menus) || '-'"></td>
                   <td class="py-3 px-3 text-on-surface-variant" x-text="formatItemList(o.side_menus) || '-'"></td>
@@ -841,7 +884,8 @@ function app() {
     by_main_menu: [], by_alacarte_menu: [], by_side_menu: [], by_custom_option: [], by_payment: [],
   });
   const freshForm = () => ({
-    name: '', main_qtys: {}, alacarte_qtys: {}, side_qtys: {}, custom_qtys: {},
+    name: '', floor: '', phone: '',
+    main_qtys: {}, alacarte_qtys: {}, side_qtys: {}, custom_qtys: {},
     custom_note: '', payment_method: 'cash',
   });
 
@@ -1050,6 +1094,27 @@ function app() {
       }).join(' ');
     },
 
+    formatFloorInput(s) {
+      const clean = String(s || '').replace(/\s+/g, ' ').trim();
+      if (!clean) return '';
+      if (/^\d+[a-zA-Z]?$/.test(clean)) return 'Lt ' + clean.toUpperCase();
+      const m = clean.match(/^(?:lt\.?|lantai)\s*(.+)$/i);
+      if (m) return 'Lt ' + this.toTitleCaseName(m[1]);
+      return this.toTitleCaseName(clean);
+    },
+
+    buyerWAGLabel(o) {
+      if (!o) return '';
+      return o.floor ? `${o.name} ${o.floor}` : o.name;
+    },
+
+    waLink(phone) {
+      let d = String(phone || '').replace(/\D/g, '');
+      if (!d) return '#';
+      if (d.startsWith('0')) d = '62' + d.slice(1);
+      return 'https://wa.me/' + d;
+    },
+
     shortName(s) {
       return this.menuParts(s).title || s;
     },
@@ -1251,6 +1316,11 @@ function app() {
 
     async submitOrder() {
       if (!this.form.name.trim()) return this.notify('Nama pemesan wajib diisi', 'error');
+      if (!this.form.floor.trim()) return this.notify('Info lantai wajib diisi', 'error');
+      const phoneClean = (this.form.phone || '').replace(/[^0-9+]/g, '');
+      const phoneDigits = phoneClean.replace(/\D/g, '');
+      if (phoneDigits.length < 8) return this.notify('Nomor HP wajib diisi dengan benar', 'error');
+
       const main_menus = (this.config.main_menus || [])
         .map(name => ({ name, qty: this.getMainQty(name) }))
         .filter(x => x.qty > 0);
@@ -1273,6 +1343,8 @@ function app() {
 
       const payload = {
         name: this.toTitleCaseName(this.form.name),
+        floor: this.formatFloorInput(this.form.floor),
+        phone: phoneClean,
         main_menus,
         alacarte_menus,
         side_menus,
@@ -1522,19 +1594,20 @@ function app() {
       const nasiRe = /^nasi\b/i;
       const sayurRe = /^(sayur|tumis|capcay|sop|sup|bening|oseng|cah|urap|pecel|lalap|lalapan)\b/i;
 
-      // Format buyer name with package detail when ordering multiple packages (e.g. "Renie [1 Paket Ayam & 1 Paket Bandeng]")
+      // Format buyer name with package detail when ordering multiple packages (e.g. "Renie Lt 10 [1 Paket Ayam & 1 Paket Bandeng]")
       const fmtPersonCustom = (order, customQty) => {
+        const who = this.buyerWAGLabel(order);
         const mains = order.main_menus || [];
         const userTotalPkg = mains.reduce((s, m) => s + m.qty, 0);
-        if (userTotalPkg <= 1 && customQty <= 1) return order.name;
+        if (userTotalPkg <= 1 && customQty <= 1) return who;
         if (customQty >= userTotalPkg && mains.length > 0) {
           const pkgDesc = mains.map(m => `${m.qty} ${this.shortName(m.name)}`).join(' & ');
-          return `${order.name} [${pkgDesc}]`;
+          return `${who} [${pkgDesc}]`;
         }
         if (mains.length === 1) {
-          return `${order.name} [${customQty} ${this.shortName(mains[0].name)}]`;
+          return `${who} [${customQty} ${this.shortName(mains[0].name)}]`;
         }
-        return `${order.name} [${customQty} Porsi]`;
+        return `${who} [${customQty} Porsi]`;
       };
 
       // Process orders oldest-first (matching WAG order 1, 2, 3...)
@@ -1579,7 +1652,7 @@ function app() {
         });
 
         if (o.custom_note && o.custom_note.trim()) {
-          customNotesList.push(`• ${o.name} : ${o.custom_note.trim()}`);
+          customNotesList.push(`• ${this.buyerWAGLabel(o)} : ${o.custom_note.trim()}`);
         }
       });
 
@@ -1691,7 +1764,7 @@ function app() {
         }
         if (o.custom_note && o.custom_note.trim()) custs.push(o.custom_note.trim());
         const custText = custs.length ? ` _(${custs.join(', ')})_` : '';
-        lines.push(`${i + 1}. ${o.name} : ${parts.join(' + ')}${custText}`);
+        lines.push(`${i + 1}. ${this.buyerWAGLabel(o)} : ${parts.join(' + ')}${custText}`);
       });
       return lines.join('\n');
     },

@@ -135,6 +135,8 @@ type Order struct {
 	ID            int64       `json:"id"`
 	Timestamp     string      `json:"timestamp"`
 	Name          string      `json:"name"`
+	Floor         string      `json:"floor"`
+	Phone         string      `json:"phone"`
 	MainMenus     []OrderItem `json:"main_menus"`
 	MainMenu      string      `json:"main_menu"`
 	AlacarteMenus []OrderItem `json:"alacarte_menus"`
@@ -387,7 +389,34 @@ func formatIDR(n int) string {
 	return "Rp " + string(out)
 }
 
-// titleCaseName capitalizes the first letter of each word in customer name (e.g. "ipang lt 10" -> "Ipang Lt 10").
+// normalizeFloor formats floor input consistently (e.g. "10" -> "Lt 10", "lt. 12" -> "Lt 12", "lobby" -> "Lobby").
+func normalizeFloor(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	if regexp.MustCompile(`^\d+[a-zA-Z]?$`).MatchString(s) {
+		return "Lt " + strings.ToUpper(s)
+	}
+	reLt := regexp.MustCompile(`(?i)^(?:lt\.?|lantai)\s*(.+)$`)
+	if m := reLt.FindStringSubmatch(s); len(m) == 2 {
+		return "Lt " + titleCaseName(m[1])
+	}
+	return titleCaseName(s)
+}
+
+// normalizePhone strips spaces/dashes while keeping digits and leading '+'.
+func normalizePhone(s string) string {
+	var out []rune
+	for i, r := range strings.TrimSpace(s) {
+		if unicode.IsDigit(r) || (i == 0 && r == '+') {
+			out = append(out, r)
+		}
+	}
+	return string(out)
+}
+
+// titleCaseName capitalizes the first letter of each word in customer name (e.g. "panji" -> "Panji").
 func titleCaseName(s string) string {
 	words := strings.Fields(s)
 	for i, w := range words {
@@ -480,6 +509,8 @@ func migrate() error {
 			id                  INTEGER PRIMARY KEY AUTOINCREMENT,
 			timestamp           DATETIME,
 			name                TEXT,
+			floor               TEXT DEFAULT '',
+			phone               TEXT DEFAULT '',
 			main_menu           TEXT,
 			main_menus_json     TEXT,
 			alacarte_menus_json TEXT,
@@ -499,6 +530,8 @@ func migrate() error {
 		}
 	}
 	alterCols := []string{
+		`ALTER TABLE Orders ADD COLUMN floor TEXT DEFAULT ''`,
+		`ALTER TABLE Orders ADD COLUMN phone TEXT DEFAULT ''`,
 		`ALTER TABLE Orders ADD COLUMN main_menus_json TEXT DEFAULT ''`,
 		`ALTER TABLE Orders ADD COLUMN alacarte_menus_json TEXT DEFAULT '[]'`,
 		`ALTER TABLE Orders ADD COLUMN custom_options_json TEXT DEFAULT '[]'`,
@@ -706,7 +739,7 @@ func countUsedQuota() (int, error) {
 }
 
 func listOrders() ([]Order, error) {
-	rows, err := db.Query(`SELECT id, timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, quota_used, total_price, payment_method, status
+	rows, err := db.Query(`SELECT id, timestamp, name, floor, phone, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, quota_used, total_price, payment_method, status
 		FROM Orders ORDER BY timestamp DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -715,13 +748,15 @@ func listOrders() ([]Order, error) {
 	out := []Order{}
 	for rows.Next() {
 		var o Order
-		var ts, name, mainMenu, mainsJSON, alacarteJSON, sidesJSON, customOptsJSON, customNote, pay, status sql.NullString
+		var ts, name, floor, phone, mainMenu, mainsJSON, alacarteJSON, sidesJSON, customOptsJSON, customNote, pay, status sql.NullString
 		var quotaUsed, totalPrice sql.NullInt64
-		if err := rows.Scan(&o.ID, &ts, &name, &mainMenu, &mainsJSON, &alacarteJSON, &sidesJSON, &customOptsJSON, &customNote, &quotaUsed, &totalPrice, &pay, &status); err != nil {
+		if err := rows.Scan(&o.ID, &ts, &name, &floor, &phone, &mainMenu, &mainsJSON, &alacarteJSON, &sidesJSON, &customOptsJSON, &customNote, &quotaUsed, &totalPrice, &pay, &status); err != nil {
 			return nil, err
 		}
 		o.Timestamp = normalizeTS(ts.String)
 		o.Name = name.String
+		o.Floor = floor.String
+		o.Phone = phone.String
 		o.MainMenus = parseOrderItems(mainsJSON.String)
 		o.AlacarteMenus = parseOrderItems(alacarteJSON.String)
 		if len(o.MainMenus) == 0 && len(o.AlacarteMenus) == 0 && strings.TrimSpace(mainMenu.String) != "" && mainMenu.String != "-" {
@@ -1190,6 +1225,8 @@ func handleUpdateConfig(c *gin.Context) {
 func handleCreateOrder(c *gin.Context) {
 	var req struct {
 		Name             string          `json:"name"`
+		Floor            string          `json:"floor"`
+		Phone            string          `json:"phone"`
 		MainMenu         string          `json:"main_menu"`
 		MainMenus        []OrderItem     `json:"main_menus"`
 		AlacarteMenus    []OrderItem     `json:"alacarte_menus"`
@@ -1210,6 +1247,19 @@ func handleCreateOrder(c *gin.Context) {
 	}
 	if len([]rune(name)) > maxNameLen {
 		fail(c, http.StatusBadRequest, fmt.Sprintf("Nama maksimal %d karakter", maxNameLen))
+		return
+	}
+	floor := normalizeFloor(req.Floor)
+	if floor == "" {
+		fail(c, http.StatusBadRequest, "Info lantai wajib diisi")
+		return
+	}
+	if len([]rune(floor)) > 30 {
+		floor = string([]rune(floor)[:30])
+	}
+	phone := normalizePhone(req.Phone)
+	if len(phone) < 8 || len(phone) > 18 {
+		fail(c, http.StatusBadRequest, "Nomor HP wajib diisi (8-18 digit)")
 		return
 	}
 	pay := strings.ToLower(strings.TrimSpace(req.PaymentMethod))
@@ -1389,9 +1439,9 @@ func handleCreateOrder(c *gin.Context) {
 	mainMenuSummary := formatItems(mains)
 	ts := time.Now().In(loc).Format(timeLayout)
 
-	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, quota_used, total_price, payment_method, status)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ts, name, mainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), note, quotaNeeded, totalPrice, pay, "baru")
+	res, err := db.Exec(`INSERT INTO Orders(timestamp, name, floor, phone, main_menu, main_menus_json, alacarte_menus_json, side_menus_json, custom_options_json, custom_note, quota_used, total_price, payment_method, status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ts, name, floor, phone, mainMenuSummary, string(mainsJSON), string(alacartesJSON), string(sidesJSON), string(customsJSON), note, quotaNeeded, totalPrice, pay, "baru")
 	if err != nil {
 		fail(c, http.StatusInternalServerError, "Gagal menyimpan pesanan")
 		return
@@ -1410,6 +1460,8 @@ func handleCreateOrder(c *gin.Context) {
 			ID:            id,
 			Timestamp:     ts,
 			Name:          name,
+			Floor:         floor,
+			Phone:         phone,
 			MainMenus:     mains,
 			MainMenu:      mainMenuSummary,
 			AlacarteMenus: alacartes,
@@ -1538,13 +1590,21 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 	})
 
 	// --- Sheet: Pesanan ---
-	cols := []interface{}{"No", "Waktu", "Nama & Lantai", "Menu Paket (Qty)", "Menu Ala Carte (Qty)", "Slot Kuota", "Add-ons (Qty)", "Custom / Catatan", "Total Tagihan (Rp)", "Status"}
+	cols := []interface{}{"No", "Waktu", "Nama", "Lantai", "Nomor HP", "Menu Paket (Qty)", "Menu Ala Carte (Qty)", "Slot Kuota", "Add-ons (Qty)", "Custom / Catatan", "Total Tagihan (Rp)", "Status"}
 	_ = f.SetSheetRow(sOrders, "A1", &cols)
-	_ = f.SetCellStyle(sOrders, "A1", "J1", header)
+	_ = f.SetCellStyle(sOrders, "A1", "L1", header)
 	_ = f.SetRowHeight(sOrders, 1, 22)
 	for i := range orders {
 		o := orders[len(orders)-1-i]
 		row := i + 2
+		fl := o.Floor
+		if fl == "" {
+			fl = "-"
+		}
+		ph := o.Phone
+		if ph == "" {
+			ph = "-"
+		}
 		mains := o.MainMenu
 		if mains == "" {
 			mains = "-"
@@ -1561,18 +1621,18 @@ func buildExcel(cfg AppConfig, orders []Order) (*excelize.File, error) {
 		if custom == "" {
 			custom = "-"
 		}
-		vals := []interface{}{i + 1, o.Timestamp, o.Name, mains, alacartes, o.QuotaUsed, sides, custom, o.TotalPrice, o.Status}
+		vals := []interface{}{i + 1, o.Timestamp, o.Name, fl, ph, mains, alacartes, o.QuotaUsed, sides, custom, o.TotalPrice, o.Status}
 		ref, _ := excelize.CoordinatesToCellName(1, row)
 		_ = f.SetSheetRow(sOrders, ref, &vals)
 	}
 	if n := len(orders); n > 0 {
-		last, _ := excelize.CoordinatesToCellName(10, n+1)
+		last, _ := excelize.CoordinatesToCellName(12, n+1)
 		_ = f.SetCellStyle(sOrders, "A2", last, cell)
-		priceEnd, _ := excelize.CoordinatesToCellName(9, n+1)
-		_ = f.SetCellStyle(sOrders, "I2", priceEnd, currency)
+		priceEnd, _ := excelize.CoordinatesToCellName(11, n+1)
+		_ = f.SetCellStyle(sOrders, "K2", priceEnd, currency)
 		_ = f.AutoFilter(sOrders, "A1:"+last, nil)
 	}
-	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 24, "D": 30, "E": 30, "F": 11, "G": 28, "H": 28, "I": 18, "J": 10} {
+	for col, w := range map[string]float64{"A": 6, "B": 20, "C": 22, "D": 12, "E": 16, "F": 30, "G": 30, "H": 11, "I": 28, "J": 28, "K": 18, "L": 10} {
 		_ = f.SetColWidth(sOrders, col, col, w)
 	}
 	_ = f.SetPanes(sOrders, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
