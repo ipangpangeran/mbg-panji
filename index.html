@@ -1445,27 +1445,63 @@ function app() {
       } catch (e) { this.notify(e.message, 'error'); }
       finally { this.exporting = false; }
     },
-    // Extract core dish name for Kitchen Report (e.g. "Paket Ayam Rica Kemangi" -> "Ayam Rica Kemangi")
+    // Extract core dish name for Kitchen Report (e.g. "Paket Ayam" -> "Ayam", "Lauk Bandeng Presto" -> "Bandeng Presto")
     kitchenDishName(raw) {
       let s = this.shortName(raw).replace(/^paket\s+/i, '').replace(/^lauk\s+/i, '').trim();
       return s || this.shortName(raw);
     },
 
-    // Report 1: Rekap Dapur (Total Paket, Total Nasi & Total Sayur setelah dikurangi custom + Lauk + Add-ons)
-    rekapDapurText() {
-      const dishMap = new Map(); // keyLower -> { label, count, unit }
-      const addDish = (label, qty, unit = 'Porsi') => {
-        if (!label || qty <= 0) return;
-        const key = label.toLowerCase() + '|' + unit.toLowerCase();
-        if (!dishMap.has(key)) dishMap.set(key, { label, count: 0, unit });
-        dishMap.get(key).count += qty;
-      };
+    // Extract the Lauk component inside a Menu Paket string (e.g. "Paket Ayam - Nasi + Ayam Rendang + ..." -> "Ayam Rendang")
+    extractPackageLaukComponent(rawPkg) {
+      let { body } = this.extractPrice(rawPkg || '');
+      const dashIdx = body.indexOf(' - ');
+      if (dashIdx > 0) body = body.slice(dashIdx + 3).trim();
+      if (!body.includes('+')) return '';
+      const nonLaukRe = /^(nasi|sayur|tumis|capcay|sop|sup|bening|oseng|cah|urap|pecel|krupuk|kerupuk|emping|peyek|sambal|sambel|kuah|lalap|lalapan)\b/i;
+      const found = body.split('+').map(p => this.extractPrice(p).body.trim()).find(p => p && !nonLaukRe.test(p));
+      return found ? found.replace(/^lauk\s+/i, '').trim() : '';
+    },
 
+    // Report 1: Rekap Dapur (Gabungan Lauk Paket + Ala Carte Lauk Saja, Add-ons Pcs/Porsi, serta Nasi Normal/Setengah/Tanpa Nasi + Nama)
+    rekapDapurText() {
+      const lines = [
+        '*REKAP DAPUR MBG*',
+        '📅 ' + this.orderDateLabel(),
+        '',
+      ];
+      if (!this.orders || !this.orders.length) {
+        lines.push('_Belum ada pesanan masuk._');
+        return lines.join('\n');
+      }
+
+      const dishGroups = new Map(); // canonicalKey -> { label, paket: 0, laukSaja: 0 }
+      const aliasToKey = new Map(); // lowerAlias -> canonicalKey
+
+      // 1. Register main dishes from configured Menu Paket & map their inner Lauk component to the same dish group!
       (this.config.main_menus || []).forEach(m => {
-        const name = this.kitchenDishName(m);
-        const key = name.toLowerCase() + '|porsi';
-        if (!dishMap.has(key)) dishMap.set(key, { label: name, count: 0, unit: 'Porsi' });
+        const label = this.kitchenDishName(m);
+        const key = label.toLowerCase();
+        if (!dishGroups.has(key)) dishGroups.set(key, { label, paket: 0, laukSaja: 0 });
+        aliasToKey.set(key, key);
+        const innerLauk = this.extractPackageLaukComponent(m);
+        if (innerLauk) aliasToKey.set(innerLauk.toLowerCase(), key);
       });
+
+      const resolveDishKey = (rawName) => {
+        const clean = this.kitchenDishName(rawName);
+        const low = clean.toLowerCase();
+        if (aliasToKey.has(low)) return aliasToKey.get(low);
+        // Also match if clean starts with an existing group key (e.g. "Ayam Rendang" -> group "Ayam")
+        for (const [k] of dishGroups.entries()) {
+          if (low === k || low.startsWith(k + ' ') || k.startsWith(low + ' ')) {
+            aliasToKey.set(low, k);
+            return k;
+          }
+        }
+        dishGroups.set(low, { label: clean, paket: 0, laukSaja: 0 });
+        aliasToKey.set(low, low);
+        return low;
+      };
 
       let totalPaket = 0;
       let extraNasi = 0;
@@ -1475,40 +1511,80 @@ function app() {
       let tanpaSayur = 0;
       let tanpaKrupuk = 0;
 
+      const nasiSetengahPeople = [];
+      const tanpaNasiPeople = [];
+      const tanpaSayurPeople = [];
+      const tanpaKrupukPeople = [];
+      const customNotesList = [];
+
       const nasiRe = /^nasi\b/i;
       const sayurRe = /^(sayur|tumis|capcay|sop|sup|bening|oseng|cah|urap|pecel|lalap|lalapan)\b/i;
 
-      (this.orders || []).forEach(o => {
+      // Format buyer name with package detail when ordering multiple packages (e.g. "Renie [1 Paket Ayam & 1 Paket Bandeng]")
+      const fmtPersonCustom = (order, customQty) => {
+        const mains = order.main_menus || [];
+        const userTotalPkg = mains.reduce((s, m) => s + m.qty, 0);
+        if (userTotalPkg <= 1 && customQty <= 1) return order.name;
+        if (customQty >= userTotalPkg && mains.length > 0) {
+          const pkgDesc = mains.map(m => `${m.qty} ${this.shortName(m.name)}`).join(' & ');
+          return `${order.name} [${pkgDesc}]`;
+        }
+        if (mains.length === 1) {
+          return `${order.name} [${customQty} ${this.shortName(mains[0].name)}]`;
+        }
+        return `${order.name} [${customQty} Porsi]`;
+      };
+
+      // Process orders oldest-first (matching WAG order 1, 2, 3...)
+      [...this.orders].reverse().forEach(o => {
         (o.main_menus || []).forEach(m => {
           totalPaket += m.qty;
-          addDish(this.kitchenDishName(m.name), m.qty, 'Porsi');
+          const k = resolveDishKey(m.name);
+          dishGroups.get(k).paket += m.qty;
         });
         (o.alacarte_menus || []).forEach(a => {
           const clean = this.shortName(a.name);
           if (this.isQuotaAlacarte(a.name)) {
-            addDish(this.kitchenDishName(a.name), a.qty, 'Porsi');
+            const k = resolveDishKey(a.name);
+            dishGroups.get(k).laukSaja += a.qty;
           } else if (nasiRe.test(clean)) {
             extraNasi += a.qty;
           } else if (sayurRe.test(clean)) {
             extraSayur += a.qty;
           } else {
-            addDish(clean, a.qty, 'Porsi');
+            const k = resolveDishKey(a.name);
+            dishGroups.get(k).laukSaja += a.qty;
           }
         });
-        // Hitung pengurangan dari Custom Paket (mis. Tanpa Nasi, Tanpa Sayur/Tumis, Nasi Setengah, Tanpa Kerupuk)
+
         (o.custom_items || []).forEach(ci => {
           const cname = this.shortName(ci.name).toLowerCase();
-          if (cname.includes('tanpa nasi')) tanpaNasi += ci.qty;
-          else if (cname.includes('nasi setengah') || cname.includes('setengah nasi')) nasiSetengah += ci.qty;
-          if (cname.includes('tanpa sayur') || cname.includes('tanpa tumis')) tanpaSayur += ci.qty;
-          if (cname.includes('tanpa kerupuk') || cname.includes('tanpa krupuk')) tanpaKrupuk += ci.qty;
+          if (cname.includes('tanpa nasi')) {
+            tanpaNasi += ci.qty;
+            tanpaNasiPeople.push(fmtPersonCustom(o, ci.qty));
+          } else if (cname.includes('nasi setengah') || cname.includes('setengah nasi')) {
+            nasiSetengah += ci.qty;
+            nasiSetengahPeople.push(fmtPersonCustom(o, ci.qty));
+          }
+          if (cname.includes('tanpa sayur') || cname.includes('tanpa tumis')) {
+            tanpaSayur += ci.qty;
+            tanpaSayurPeople.push(fmtPersonCustom(o, ci.qty));
+          }
+          if (cname.includes('tanpa kerupuk') || cname.includes('tanpa krupuk')) {
+            tanpaKrupuk += ci.qty;
+            tanpaKrupukPeople.push(fmtPersonCustom(o, ci.qty));
+          }
         });
+
+        if (o.custom_note && o.custom_note.trim()) {
+          customNotesList.push(`• ${o.name} : ${o.custom_note.trim()}`);
+        }
       });
 
-      // Aggregate Add-ons: convert "<Item> <N>pcs" into total Pcs (e.g. 2pcs + 4pcs -> total Pcs!)
+      // 2. Aggregate Add-ons: convert "<Item> <N>pcs" into total Pcs (e.g. 2pcs + 4pcs -> total Pcs)
       const sideMap = new Map();
       const pcsRe = /^(.+?)\s+(\d+)\s*pcs$/i;
-      (this.orders || []).forEach(o => {
+      [...this.orders].reverse().forEach(o => {
         (o.side_menus || []).forEach(s => {
           const clean = this.shortName(s.name);
           const pm = clean.match(pcsRe);
@@ -1526,57 +1602,61 @@ function app() {
         });
       });
 
-      const dishRows = Array.from(dishMap.values()).filter(r => r.count > 0);
-      const sideRows = Array.from(sideMap.values()).filter(r => r.count > 0);
+      // Build Section 1: Lauk & Add-ons
+      const topRows = [];
+      dishGroups.forEach(g => {
+        const total = g.paket + g.laukSaja;
+        if (total <= 0) return;
+        let detail = '';
+        if (g.paket > 0 && g.laukSaja > 0) detail = ` (Rincian: ${g.paket} Paket + ${g.laukSaja} Lauk Saja)`;
+        else if (g.paket === 0 && g.laukSaja > 0) detail = ` (Rincian: ${g.laukSaja} Lauk Saja)`;
+        topRows.push({ label: g.label, val: `${total} Porsi${detail}` });
+      });
+      sideMap.forEach(s => {
+        if (s.count > 0) topRows.push({ label: s.label, val: `${s.count} ${s.unit}` });
+      });
 
-      const lines = [
-        '*REKAP DAPUR MBG*',
-        '📅 ' + this.orderDateLabel(),
-        '',
-      ];
-
-      if (!this.orders.length) {
-        lines.push('_Belum ada pesanan masuk._');
-        return lines.join('\n');
-      }
-
-      const totalNasi = Math.max(0, totalPaket - tanpaNasi) + extraNasi;
+      // Build Section 2: Nasi, Sayur & Custom Breakdown with Buyer Names
+      const nasiNormal = Math.max(0, totalPaket - tanpaNasi - nasiSetengah) + extraNasi;
       const totalSayur = Math.max(0, totalPaket - tanpaSayur) + extraSayur;
       const totalKrupuk = Math.max(0, totalPaket - tanpaKrupuk);
 
-      const stapleRows = [
+      const bottomRows = [
         { label: 'Total Paket', val: `${totalPaket} Paket` },
-        { label: 'Total Nasi', val: `${totalNasi} Porsi` + (nasiSetengah > 0 ? ` (${nasiSetengah} Setengah)` : '') },
-        { label: 'Total Sayur', val: `${totalSayur} Porsi` },
+        { label: 'Nasi Normal', val: `${nasiNormal} Porsi` + (extraNasi > 0 ? ` (Termasuk ${extraNasi} Nasi Ala Carte)` : '') },
       ];
+      if (nasiSetengah > 0) {
+        bottomRows.push({ label: 'Nasi Setengah', val: `${nasiSetengah} Porsi (${nasiSetengahPeople.join(', ')})` });
+      }
+      if (tanpaNasi > 0) {
+        bottomRows.push({ label: 'Tanpa Nasi', val: `${tanpaNasi} Porsi (${tanpaNasiPeople.join(', ')})` });
+      }
+      bottomRows.push({ label: 'Total Sayur', val: `${totalSayur} Porsi` });
+      if (tanpaSayur > 0) {
+        bottomRows.push({ label: 'Tanpa Sayur', val: `${tanpaSayur} Porsi (${tanpaSayurPeople.join(', ')})` });
+      }
       if (totalPaket > 0) {
-        stapleRows.push({ label: 'Total Krupuk', val: `${totalKrupuk} Bks` });
+        bottomRows.push({ label: 'Total Krupuk', val: `${totalKrupuk} Bks` });
+      }
+      if (tanpaKrupuk > 0) {
+        bottomRows.push({ label: 'Tanpa Kerupuk', val: `${tanpaKrupuk} Paket (${tanpaKrupukPeople.join(', ')})` });
       }
 
-      const itemRows = [
-        ...dishRows.map(r => ({ label: r.label, val: `${r.count} ${r.unit}` })),
-        ...sideRows.map(r => ({ label: r.label, val: `${r.count} ${r.unit}` })),
-      ];
-
-      const allLabels = [...stapleRows.map(r => r.label), ...itemRows.map(r => r.label)];
-      const maxLen = Math.max(...allLabels.map(l => l.length), 12);
+      const allLabels = [...topRows.map(r => r.label), ...bottomRows.map(r => r.label)];
+      const maxLen = Math.max(...allLabels.map(l => l.length), 13);
 
       lines.push('```');
-      stapleRows.forEach(r => {
+      topRows.forEach(r => {
         lines.push(`${r.label.padEnd(maxLen, ' ')} : ${r.val}`);
       });
-      if (itemRows.length) {
-        lines.push('-'.repeat(maxLen + 12));
-        itemRows.forEach(r => {
-          lines.push(`${r.label.padEnd(maxLen, ' ')} : ${r.val}`);
-        });
-      }
+      lines.push('');
+      bottomRows.forEach(r => {
+        lines.push(`${r.label.padEnd(maxLen, ' ')} : ${r.val}`);
+      });
       lines.push('```');
 
-      const customs = (this.summary.by_custom_option || []).filter(x => x.count > 0);
-      if (customs.length) {
-        lines.push('', '*Rincian Custom Paket:*');
-        customs.forEach(c => lines.push(`• ${this.shortName(c.name)} : ${c.count} Paket`));
+      if (customNotesList.length) {
+        lines.push('', '*Catatan Tambahan Pembeli:*', ...customNotesList);
       }
       return lines.join('\n');
     },
