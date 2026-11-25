@@ -913,8 +913,12 @@ function app() {
     orders: [],
     summary: emptySummary(),
     saving: false, togglingOpen: false, exporting: false, refreshing: false,
-    quotaSyncStatus: '', quotaTimer: null, sseSource: null,
+    quotaSyncStatus: '', quotaTimer: null, sseSource: null, orderPollTimer: null, adminPollTimer: null,
     confirmReset: false,
+
+    get isRealtimeActive() {
+      return Boolean(this.config && this.config.is_open && (this.config.remaining || 0) > 0);
+    },
 
     get quotaPct() { return this.summary.quota > 0 ? Math.min(100, Math.round(this.summary.total / this.summary.quota * 100)) : 100; },
     get totalMainQty() {
@@ -1234,7 +1238,7 @@ function app() {
       window.addEventListener('hashchange', () => { this.view = location.hash === '#admin' ? 'admin' : 'order'; this.onViewChange(); });
       window.addEventListener('keydown', (e) => this.onKey(e));
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) {
+        if (!document.hidden && this.isRealtimeActive) {
           this.loadConfig();
           if (this.view === 'admin' && this.authed) this.refreshAdmin(false, false);
         }
@@ -1245,17 +1249,45 @@ function app() {
         catch { this.pin = ''; sessionStorage.removeItem('mbg_pin'); }
       }
       this.loading = false;
-      this.onViewChange();
-      this.connectSSE();
-      // Fast fallback polling in case any mobile carrier/proxy buffers SSE
-      setInterval(() => { if (this.view === 'order' && !document.hidden) this.loadConfig(); }, 4000);
-      setInterval(() => { if (this.view === 'admin' && this.authed && !document.hidden) this.refreshAdmin(false, false); }, 6000);
+      if (this.view === 'admin' && this.authed) {
+        await this.refreshAdmin();
+      }
+      this.syncRealtime();
+    },
+
+    syncRealtime() {
+      if (this.isRealtimeActive) {
+        this.connectSSE();
+        if (!this.orderPollTimer) {
+          // Fast fallback polling while store is open & quota remains
+          this.orderPollTimer = setInterval(() => {
+            if (this.view === 'order' && !document.hidden && this.isRealtimeActive) this.loadConfig();
+          }, 4000);
+        }
+        if (!this.adminPollTimer) {
+          this.adminPollTimer = setInterval(() => {
+            if (this.view === 'admin' && this.authed && !document.hidden && this.isRealtimeActive) this.refreshAdmin(false, false);
+          }, 6000);
+        }
+      } else {
+        this.disconnectSSE();
+        if (this.orderPollTimer) { clearInterval(this.orderPollTimer); this.orderPollTimer = null; }
+        if (this.adminPollTimer) { clearInterval(this.adminPollTimer); this.adminPollTimer = null; }
+      }
+    },
+
+    disconnectSSE() {
+      if (this.sseSource) {
+        try { this.sseSource.close(); } catch {}
+        this.sseSource = null;
+      }
     },
 
     connectSSE() {
-      if (typeof EventSource === 'undefined') return;
+      if (typeof EventSource === 'undefined' || !this.isRealtimeActive) return;
+      if (this.sseSource && this.sseSource.readyState !== 2) return;
       try {
-        if (this.sseSource) this.sseSource.close();
+        this.disconnectSSE();
         const es = new EventSource('/api/events');
         this.sseSource = es;
         es.addEventListener('state', (ev) => {
@@ -1268,6 +1300,9 @@ function app() {
             }
           } catch {}
         });
+        es.onerror = () => {
+          if (!this.isRealtimeActive) this.disconnectSSE();
+        };
       } catch {}
     },
 
@@ -1282,6 +1317,7 @@ function app() {
       Object.keys(this.form.side_qtys).forEach(k => { if (!c.side_menus.includes(k)) delete this.form.side_qtys[k]; });
       Object.keys(this.form.custom_qtys).forEach(k => { if (!c.custom_options.includes(k)) delete this.form.custom_qtys[k]; });
       this.clampCustomQtys();
+      this.syncRealtime();
     },
 
     go(v) { location.hash = v === 'admin' ? 'admin' : ''; this.view = v; this.onViewChange(); window.scrollTo({ top: 0, behavior: 'smooth' }); },
@@ -1449,6 +1485,7 @@ function app() {
         this.summary.remaining = Math.max(0, q - (this.summary.total || 0));
         this.config.global_quota = q;
         this.config.remaining = this.summary.remaining;
+        this.syncRealtime();
         this.quotaSyncStatus = 'saved';
         setTimeout(() => { if (this.quotaSyncStatus === 'saved') this.quotaSyncStatus = ''; }, 2000);
       } catch (e) {
@@ -1462,6 +1499,7 @@ function app() {
       try {
         await this.api('/api/config', { method: 'POST', body: JSON.stringify({ is_open: next }) });
         this.config.is_open = next; this.summary.is_open = next;
+        this.syncRealtime();
         this.notify(next ? 'Status: Buka' : 'Status: Tutup');
       } catch (e) { this.admin.is_open = !next; this.notify(e.message, 'error'); }
       finally { this.togglingOpen = false; }
