@@ -78,7 +78,8 @@
 
 <!-- ===================== HEADER ===================== -->
 <header class="fixed top-0 inset-x-0 z-40 bg-surface/85 backdrop-blur-xl shadow-[0_1px_8px_rgba(0,0,0,0.04)] pt-safe">
-  <div class="h-16 max-w-5xl mx-auto px-4 flex items-center justify-between gap-2">
+  <div class="h-16 mx-auto px-4 flex items-center justify-between gap-2 transition-all"
+       :class="view === 'admin' && authed ? 'max-w-[1400px]' : 'max-w-5xl'">
     <a href="#" @click.prevent="go('order')" class="flex items-center gap-2.5 min-w-0">
       <img src="/logo.jpg" alt="Logo MBG APS"
            class="w-10 h-10 rounded-xl bg-white object-contain p-0.5 shadow-sm border border-slate-200/80 flex-shrink-0" />
@@ -471,7 +472,7 @@
   </section>
 
   <!-- ===================== ADMIN: DASHBOARD ===================== -->
-  <section x-cloak x-show="!loading && view === 'admin' && authed" class="max-w-5xl mx-auto space-y-6">
+  <section x-cloak x-show="!loading && view === 'admin' && authed" class="max-w-[1400px] mx-auto space-y-6">
 
     <!-- Greeting -->
     <div class="glass rounded-3xl shadow-card p-5 flex items-center justify-between gap-3">
@@ -758,54 +759,54 @@
 
         <!-- Desktop table -->
         <div class="hidden md:block overflow-x-auto" x-show="orders.length">
-          <table class="w-full text-sm">
+          <table class="w-full text-[13px]">
             <thead>
-              <tr class="text-left text-xs uppercase tracking-wider text-on-surface-variant">
-                <th class="py-2.5 px-3 font-semibold">#</th>
-                <th class="py-2.5 px-3 font-semibold">Waktu</th>
-                <th class="py-2.5 px-3 font-semibold">Nama</th>
-                <th class="py-2.5 px-3 font-semibold">Lantai</th>
-                <th class="py-2.5 px-3 font-semibold">Nomor HP</th>
-                <th class="py-2.5 px-3 font-semibold">Menu Paket</th>
-                <th class="py-2.5 px-3 font-semibold">Ala Carte</th>
-                <th class="py-2.5 px-3 font-semibold">Add-ons</th>
-                <th class="py-2.5 px-3 font-semibold">Custom / Catatan</th>
-                <th class="py-2.5 px-3 font-semibold">Total</th>
-                <th class="py-2.5 px-3 font-semibold text-right">ACTION</th>
+              <tr class="text-left text-[11px] uppercase tracking-wider text-on-surface-variant">
+                <th class="py-2.5 px-2 font-semibold">#</th>
+                <th class="py-2.5 px-2 font-semibold">Waktu</th>
+                <th class="py-2.5 px-2.5 font-semibold">Nama</th>
+                <th class="py-2.5 px-2 font-semibold">Lantai</th>
+                <th class="py-2.5 px-2.5 font-semibold">Nomor HP</th>
+                <th class="py-2.5 px-2.5 font-semibold">Menu Paket</th>
+                <th class="py-2.5 px-2.5 font-semibold">Ala Carte</th>
+                <th class="py-2.5 px-2.5 font-semibold">Add-ons</th>
+                <th class="py-2.5 px-2.5 font-semibold">Custom / Catatan</th>
+                <th class="py-2.5 px-2.5 font-semibold">Total</th>
+                <th class="py-2.5 px-2 font-semibold text-right">ACTION</th>
               </tr>
             </thead>
             <tbody>
               <template x-for="o in orders" :key="'t-' + o.id">
                 <tr class="border-t border-slate-100 hover:bg-surface-container-low/60 align-top">
-                  <td class="py-3 px-3 font-bold text-primary" x-text="String(o.id).padStart(3,'0')"></td>
-                  <td class="py-3 px-3 text-on-surface-variant whitespace-nowrap" x-text="timeOf(o.timestamp)"></td>
-                  <td class="py-3 px-3 font-semibold" x-text="o.name"></td>
-                  <td class="py-3 px-3 whitespace-nowrap">
+                  <td class="py-3 px-2 font-bold text-primary whitespace-nowrap" x-text="String(o.id).padStart(3,'0')"></td>
+                  <td class="py-3 px-2 text-on-surface-variant whitespace-nowrap" x-text="timeOf(o.timestamp)"></td>
+                  <td class="py-3 px-2.5 font-semibold" x-text="o.name"></td>
+                  <td class="py-3 px-2 whitespace-nowrap">
                     <span x-show="o.floor" class="px-2 py-0.5 rounded-full bg-emerald-50 text-primary text-xs font-semibold" x-text="o.floor"></span>
                     <span x-show="!o.floor" class="text-on-surface-variant">-</span>
                   </td>
-                  <td class="py-3 px-3 whitespace-nowrap">
+                  <td class="py-3 px-2.5 whitespace-nowrap">
                     <a x-show="o.phone" :href="waLink(o.phone)" target="_blank" rel="noopener" class="text-primary font-medium hover:underline" x-text="o.phone"></a>
                     <span x-show="!o.phone" class="text-on-surface-variant">-</span>
                   </td>
-                  <td class="py-3 px-3 font-medium" x-text="formatItemList(o.main_menus) || '-'"></td>
-                  <td class="py-3 px-3 text-secondary font-medium" x-text="formatItemList(o.alacarte_menus) || '-'"></td>
-                  <td class="py-3 px-3 text-on-surface-variant" x-text="formatItemList(o.side_menus) || '-'"></td>
-                  <td class="py-3 px-3">
-                    <span x-show="hasCustom(o)" class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-amber-50 text-amber-900 text-xs font-semibold" x-text="formatCustomOrder(o)"></span>
+                  <td class="py-3 px-2.5 font-medium" x-text="formatItemList(o.main_menus) || '-'"></td>
+                  <td class="py-3 px-2.5 text-secondary font-medium" x-text="formatItemList(o.alacarte_menus) || '-'"></td>
+                  <td class="py-3 px-2.5 text-on-surface-variant" x-text="formatItemList(o.side_menus) || '-'"></td>
+                  <td class="py-3 px-2.5">
+                    <span x-show="hasCustom(o)" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-amber-50 text-amber-900 text-xs font-semibold" x-text="formatCustomOrder(o)"></span>
                     <span x-show="!hasCustom(o)" class="text-on-surface-variant">-</span>
                   </td>
-                  <td class="py-3 px-3 font-head font-bold text-primary whitespace-nowrap" x-text="o.total_price > 0 ? formatIDR(o.total_price) : '-'"></td>
-                  <td class="py-3 px-3 whitespace-nowrap text-right">
-                    <div class="inline-flex items-center justify-end gap-1.5">
+                  <td class="py-3 px-2.5 font-head font-bold text-primary whitespace-nowrap" x-text="o.total_price > 0 ? formatIDR(o.total_price) : '-'"></td>
+                  <td class="py-3 px-2 whitespace-nowrap text-right">
+                    <div class="inline-flex items-center justify-end gap-1">
                       <button type="button" @click="openEditOrder(o)" title="Edit Pesanan"
-                              class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-emerald-50 text-primary hover:bg-emerald-100 text-xs font-semibold transition">
-                        <span class="material-symbols-outlined text-[15px]">edit</span>
+                              class="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-50 text-primary hover:bg-emerald-100 text-xs font-semibold transition">
+                        <span class="material-symbols-outlined text-[14px]">edit</span>
                         <span>Edit</span>
                       </button>
                       <button type="button" @click="askDeleteOrder(o)" title="Hapus Pesanan"
-                              class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-red-50 text-tertiary hover:bg-red-100 text-xs font-semibold transition">
-                        <span class="material-symbols-outlined text-[15px]">delete</span>
+                              class="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-red-50 text-tertiary hover:bg-red-100 text-xs font-semibold transition">
+                        <span class="material-symbols-outlined text-[14px]">delete</span>
                         <span>Delete</span>
                       </button>
                     </div>
